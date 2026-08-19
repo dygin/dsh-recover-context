@@ -11,7 +11,7 @@
 ## 安装
 
 ```bash
-dsh plugin --profile web add dsh-recover-context@latest
+dsh plugin --profile web add dsh-recover-context@1.0.2
 ```
 
 
