@@ -1,0 +1,15 @@
+# dsh-recover-context bundle patch
+#
+# This file is the `dsh.bundle.patch` layer of the published npm package: when
+# the plugin is installed through the official CLI —
+#
+#   dsh plugin --profile <name> add dsh-recover-context@<version>
+#
+# — the command reconciles `dsh.profile.bundles` against installed packages
+# and, seeing this declaration, appends `dsh-recover-context` to the bundle
+# stack. The profile boot then merges THIS patch (a single `insert` of the
+# plugin row) exactly like the manual cordis.patch.yml mount line used
+# before. No profile file edits needed — one command installs and mounts.
+- insert:
+    - id: dsh-recover-context
+      name: 'dsh-recover-context'

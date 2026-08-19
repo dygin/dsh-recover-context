@@ -1,0 +1,69 @@
+{
+  "name": "dsh-recover-context",
+  "version": "1.0.0",
+  "description": "DSH web plugin: Trae-style conversation rollback and last-question editing. Roll back any completed turn to restart from a clean context (including workspace files produced later), and edit the last submitted question and resubmit it, replacing the wrong context.",
+  "author": "dsh_recover_context",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-name/dsh-recover-context.git"
+  },
+  "homepage": "https://github.com/your-name/dsh-recover-context#readme",
+  "bugs": {
+    "url": "https://github.com/your-name/dsh-recover-context/issues"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node tests/checkpoints.test.mjs && node tests/host.test.mjs && node scripts/test-client-logic.mjs",
+    "release": "bash scripts/publish.sh"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "rollback",
+    "undo",
+    "conversation",
+    "checkpoint",
+    "ui"
+  ],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.1",
+    "esbuild": "^0.25.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.7.0"
+  },
+  "packageManager": "pnpm@11.3.0"
+}
