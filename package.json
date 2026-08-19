@@ -5,11 +5,11 @@
   "author": "dsh_recover_context",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-name/dsh-recover-context.git"
+    "url": "git+https://github.com/dygin/dsh-recover-context.git"
   },
-  "homepage": "https://github.com/your-name/dsh-recover-context#readme",
+  "homepage": "https://github.com/dygin/dsh-recover-context#readme",
   "bugs": {
-    "url": "https://github.com/your-name/dsh-recover-context/issues"
+    "url": "https://github.com/dygin/dsh-recover-context/issues"
   },
   "type": "module",
   "main": "lib/index.js",
