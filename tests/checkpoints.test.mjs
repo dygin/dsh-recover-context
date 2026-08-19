@@ -82,6 +82,32 @@ try {
   assertEqual(list.length, 2, 'two turn checkpoints listed')
   assertEqual(list[0].turn, 1, 'first checkpoint is turn 1')
 
+  // ── fork-child scenario: a child session inherits seeded turns and has NO
+  // checkpoint for them; restoring to a seeded turn must fall back to the
+  // baseline (the fork-point state) instead of returning mode 'none'.
+  const childData = join(base, 'data-child')
+  const child = new CheckpointStore(childData, workspace)
+  // The child only observes its own live events — turn 2 onward (the seed
+  // carried turn 1). Its first live event takes the baseline; only turn 2
+  // gets a checkpoint.
+  await child.ensureBaseline()
+  await writeFile(join(workspace, 'src', 'app.js'), 'console.log(9)\n') // turn-2 work
+  await child.recordTurn(2, 200)
+  const childEvents = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'turn/end', seq: 183, data: { turn: 1 } }, // seeded turn — in the log, but no checkpoint
+    { type: 'turn/start', seq: 184, data: { turn: 2 } },
+    { type: 'user/message', seq: 185, data: {} },
+    { type: 'turn/end', seq: 200, data: { turn: 2 } },
+  ]
+  // Restore to turn 1 (a seeded turn, no checkpoint): falls back to baseline.
+  const childRestore = await child.restore(childEvents, { atSeq: 183, dryRun: true })
+  assertEqual(childRestore.mode, 'baseline', 'fork-child rollback to a seeded turn falls back to baseline')
+  assertTrue(childRestore.restored.includes('src/app.js'), 'seeded-turn rollback restores baseline content')
+  assertEqual(childRestore.boundary?.turn, 1, 'boundary still reports the seeded turn')
+  const childReal = await child.restore(childEvents, { atSeq: 183 })
+  assertEqual(await readFile(join(workspace, 'src', 'app.js'), 'utf8'), 'console.log(1)\n', 'fork-child rollback rewinds the file to the baseline state')
+
   console.log('checkpoints.test.mjs: all assertions passed ✓')
 } finally {
   await rm(base, { recursive: true, force: true })

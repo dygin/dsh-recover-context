@@ -1,6 +1,6 @@
 {
   "name": "dsh-recover-context",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "DSH web plugin: Trae-style conversation rollback and last-question editing. Roll back any completed turn to restart from a clean context (including workspace files produced later), and edit the last submitted question and resubmit it, replacing the wrong context.",
   "author": "dsh_recover_context",
   "repository": {

@@ -24,7 +24,7 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 
 /** Default names/dirs never tracked (heavy or VCS metadata). */
 export const DEFAULT_IGNORE_NAMES = [
-  '.git', 'node_modules', '.venv', 'venv', '__pycache__', 'dist', 'build',
+  '.git', 'node_modules', '.pnpm-store', '.venv', 'venv', '__pycache__', 'dist', 'build',
   '.next', '.nuxt', '.idea', '.vscode', '.mypy_cache', '.pytest_cache',
   '.DS_Store', 'coverage', '.turbo', '.cache', 'target',
 ]
@@ -385,8 +385,20 @@ export class CheckpointStore {
       return { checkpoint: this.baseline, boundary: undefined }
     }
     const turn = boundaryEvent.data.turn
+    // The exact checkpoint for the boundary turn wins. When it is missing —
+    // a forked child has no checkpoints for its SEEDED (inherited) turns —
+    // fall back to the nearest checkpoint at or before the boundary; the
+    // baseline represents the fork-point state, which is exactly the
+    // pre-boundary state for a child that forked through that turn.
+    let checkpoint = this.turns.get(turn)
+    if (checkpoint === undefined) {
+      for (let earlier = turn - 1; earlier >= 1 && checkpoint === undefined; earlier -= 1) {
+        checkpoint = this.turns.get(earlier)
+      }
+      checkpoint ??= this.baseline
+    }
     return {
-      checkpoint: this.turns.get(turn),
+      checkpoint,
       boundary: { turn, endSeq: boundaryEvent.seq },
     }
   }
