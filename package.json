@@ -1,6 +1,6 @@
 {
   "name": "dsh-recover-context",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "dsh conversation rollback and last-question editing. Roll back any completed turn to restart from a clean context and edit the last submitted question and resubmit it, replacing the wrong context.",
   "author": "dsh_recover_context",
   "repository": {
