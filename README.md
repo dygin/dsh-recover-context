@@ -1,6 +1,6 @@
 # dsh-recover-context
 
-> v1.0.0
+> v1.0.4
 
 恢复上下文插件
 
