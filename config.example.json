@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "ignoreNames": [".git", "node_modules", ".pnpm-store", "dist", "build", ".venv", "__pycache__", ".DS_Store"],
+  "ignorePatterns": ["*.pyc", "*.log", "*.tmp"],
+  "trackSizeCap": 5242880,
+  "blobSizeCap": 1048576
+}
