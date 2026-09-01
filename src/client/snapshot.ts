@@ -1,11 +1,9 @@
 /**
- * Structural reads over the conversation snapshot. The snapshot shape is
- * declared by @deepseek-ai/dsh-client-runtime; this file only reads the
- * slices the plugin needs and stays structurally typed so the client bundle
- * needs no runtime dependency on the runtime package.
+ * 客户端结构化读取会话快照。
+ * 会话快照结构由 @deepseek-ai/dsh-client-runtime 定义；本文件仅作结构化读取。
  */
 
-/** The conversation snapshot slice this plugin reads. */
+/** 插件读取的会话快照结构 */
 export interface SnapshotLike {
   removed: boolean
   running: boolean
@@ -25,7 +23,7 @@ export interface SnapshotLike {
   turnEnds: ReadonlyMap<number, number>
 }
 
-/** One chat view node (structural subset). */
+/** 单个聊天视图节点（结构子集） */
 export interface NodeLike {
   key: string
   kind: string
@@ -33,13 +31,13 @@ export interface NodeLike {
   data: Record<string, unknown> | null | undefined
 }
 
-/** One text content block. */
+/** 文本内容块 */
 interface TextBlockLike {
   type?: string
   text?: string
 }
 
-/** Join the text blocks of a message's content. */
+/** 拼接消息的所有文本块 */
 export function textOfContent(content: readonly TextBlockLike[] | undefined): string {
   if (content === undefined) return ''
   return content
@@ -49,12 +47,7 @@ export function textOfContent(content: readonly TextBlockLike[] | undefined): st
 }
 
 /**
- * Find the finalized assistant node carrying one messageId.
- *
- * The chat-node dispatch kind for assistant rows is `assistant-step` (the
- * definition kind), NOT `assistant` — so the lookup must not depend on the
- * kind at all and keys purely on the node payload's `finalNode.messageId`
- * (which only assistant nodes carry).
+ * 根据 messageId 查找已完成的 Assistant 节点。
  */
 export function assistantByMessageId(snap: SnapshotLike, messageId: string): NodeLike | undefined {
   return snap.chat.nodes.values().find((node) => {
@@ -63,12 +56,12 @@ export function assistantByMessageId(snap: SnapshotLike, messageId: string): Nod
   })
 }
 
-/** The turn that owns a node key, or undefined. */
+/** 获取某个节点所属的轮次编号 */
 export function turnOfNode(snap: SnapshotLike, key: string): number | undefined {
   return snap.chat.timeline.turnOrder.find(turn => snap.chat.locations.getTurn(turn).includes(key))
 }
 
-/** The last user message node of a turn (the question that opened it). */
+/** 获取某轮的用户提问节点（开启该轮的用户消息） */
 export function userNodeOfTurn(snap: SnapshotLike, turn: number): NodeLike | undefined {
   const keys = snap.chat.locations.getTurn(turn)
   for (const key of keys) {
@@ -78,20 +71,20 @@ export function userNodeOfTurn(snap: SnapshotLike, turn: number): NodeLike | und
   return undefined
 }
 
-/** Analysis for one assistant message's action row. */
+/** 单条 Assistant 消息的操作栏分析信息 */
 export interface TurnActionInfo {
   turn: number
   nodeSeq: number
   userText: string
-  /** Whether any later turn (running or completed) exists. */
+  /** 是否存在后续轮次（运行中或已完成） */
   hasLater: boolean
-  /** Whether this is the last turn AND it is completed. */
+  /** 是否是最后一轮且已完成 */
   isLastCompleted: boolean
-  /** Boundary anchor for the edit: previous completed turn's end seq, or null. */
+  /** 编辑截断锚点：上一已完成轮次的 turn/end seq，无则为 null */
   editBoundarySeq: number | null
 }
 
-/** Analyze the snapshot for the assistant message addressed by `messageId`. */
+/** 根据 messageId 分析 Assistant 消息 */
 export function analyzeTurnAction(snap: SnapshotLike, messageId: string): TurnActionInfo | null {
   const node = assistantByMessageId(snap, messageId)
   if (node === undefined) return null
@@ -111,27 +104,25 @@ export function analyzeTurnAction(snap: SnapshotLike, messageId: string): TurnAc
   return { turn, nodeSeq: node.anchorSeq, userText, hasLater, isLastCompleted, editBoundarySeq }
 }
 
-/** Analysis for one user question's action row (rollback / edit icons under the question). */
+/** 单个用户问题操作行的分析信息（问题下方的回滚/编辑图标） */
 export interface QuestionActionInfo {
-  /** The turn the question opened. */
+  /** 该问题开启的轮次编号 */
   turn: number
-  /** The user message's seq (not used for the fork anchor directly). */
+  /** 用户消息的 seq */
   nodeSeq: number
-  /** The question's plain text (for the edit draft). */
+  /** 用户问题纯文本（载入输入框使用） */
   userText: string
-  /** Whether this is the most recent user question (nothing asked after it). */
+  /** 是否为最近一次提问 */
   isLastQuestion: boolean
   /**
-   * Fork anchor that cuts BEFORE this question: the previous completed
-   * turn's `turn/end` seq, or null when this is the first question (then a
-   * blank child + baseline restore is used instead).
+   * 截断在该问题之前的锚点序列号：上一完成轮次的 turn/end seq，
+   * 若为第一个问题则为 null（代表创建空白子会话并还原初始基线）。
    */
   boundarySeq: number | null
 }
 
 /**
- * Analyze the snapshot for the question node addressed by its chat node key
- * (rendered by the plugin's own `recover-actions` conversation node).
+ * 根据聊天节点 key 分析用户问题节点
  */
 export function analyzeQuestion(snap: SnapshotLike, nodeKey: string): QuestionActionInfo | null {
   const node = snap.chat.nodes.get(nodeKey)
@@ -139,7 +130,6 @@ export function analyzeQuestion(snap: SnapshotLike, nodeKey: string): QuestionAc
   const turn = turnOfNode(snap, nodeKey)
   if (turn === undefined) return null
   const userText = textOfContent(node.data?.content as readonly TextBlockLike[] | undefined)
-  // Latest user message seq across the window — "is this the last question?".
   const userSeqs = snap.chat.nodes.values()
     .filter(candidate => candidate.kind === 'user')
     .map(candidate => candidate.anchorSeq)
@@ -154,17 +144,16 @@ export function analyzeQuestion(snap: SnapshotLike, nodeKey: string): QuestionAc
   return { turn, nodeSeq: node.anchorSeq, userText, isLastQuestion, boundarySeq }
 }
 
-/** Analysis for the composer edit affordance (running turn, last content is the question). */
+/** 输入框编辑操作的分析信息（轮次运行中，最新内容仍是问题） */
 export interface ComposerEditInfo {
   userText: string
-  /** Boundary anchor: last completed turn's end seq before the running turn, or null. */
+  /** 截断锚点：运行中轮次之前的最后一个已完成轮次的 end seq，无则为 null */
   boundarySeq: number | null
 }
 
 /**
- * Whether the composer should offer "edit last question": the session is
- * running and the newest chat node is still the user's question (the answer
- * has not started finalizing).
+ * 判断输入框是否应提供“编辑上一问题”按钮：
+ * 当会话正在运行中且最新的聊天节点仍是用户的提问时呈现。
  */
 export function analyzeComposerEdit(snap: SnapshotLike): ComposerEditInfo | null {
   if (snap.removed || !snap.running) return null

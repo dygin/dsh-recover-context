@@ -108,6 +108,59 @@ try {
   const childReal = await child.restore(childEvents, { atSeq: 183 })
   assertEqual(await readFile(join(workspace, 'src', 'app.js'), 'utf8'), 'console.log(1)\n', 'fork-child rollback rewinds the file to the baseline state')
 
+  // ── .gitignore support test ──────────────────────────────────────────────
+  const gitignoreWs = join(base, 'ws-gitignore')
+  const gitignoreData = join(base, 'data-gitignore')
+  await mkdir(gitignoreWs, { recursive: true })
+  await writeFile(join(gitignoreWs, '.gitignore'), 'stuff/\n*.secret\n!important.secret\n')
+  await mkdir(join(gitignoreWs, 'stuff'), { recursive: true })
+  await writeFile(join(gitignoreWs, 'stuff', 'big.bin'), 'huge stuff')
+  await writeFile(join(gitignoreWs, 'file.secret'), 'hidden')
+  await writeFile(join(gitignoreWs, 'important.secret'), 'kept')
+  await writeFile(join(gitignoreWs, 'normal.txt'), 'normal')
+
+  const gitignoreStore = new CheckpointStore(gitignoreData, gitignoreWs)
+  const gitignoreBaseline = await gitignoreStore.ensureBaseline()
+  assertTrue('normal.txt' in gitignoreBaseline.files, 'normal.txt is tracked')
+  assertTrue('important.secret' in gitignoreBaseline.files, 'negated important.secret is tracked')
+  assertTrue(!('stuff/big.bin' in gitignoreBaseline.files), 'stuff/ directory is ignored via .gitignore')
+  assertTrue(!('file.secret' in gitignoreBaseline.files), '*.secret is ignored via .gitignore')
+
+  // ── CAS deduplication & backward compatibility test ──────────────────────
+  const legacyData = join(base, 'data-legacy')
+  await mkdir(legacyData, { recursive: true })
+  // Simulate a legacy checkpoint with inline blobs
+  const legacyCheckpoint = {
+    kind: 'turn',
+    turn: 1,
+    endSeq: 100,
+    at: Date.now(),
+    files: {
+      'legacy.txt': { sha: 'legacysha', size: 10, mtimeMs: 1000 },
+    },
+    blobs: {
+      'legacy.txt': Buffer.from('legacy content\n').toString('base64'),
+    },
+  }
+  await writeFile(join(legacyData, 'baseline.json'), JSON.stringify({
+    kind: 'baseline',
+    turn: 0,
+    endSeq: -1,
+    at: Date.now(),
+    files: {},
+  }))
+  await writeFile(join(legacyData, 'turn-1.json'), JSON.stringify(legacyCheckpoint))
+  const legacyWs = join(base, 'ws-legacy')
+  await mkdir(legacyWs, { recursive: true })
+  const legacyStore = new CheckpointStore(legacyData, legacyWs)
+  const legacyEvents = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'turn/end', seq: 100, data: { turn: 1 } },
+  ]
+  const legacyRestore = await legacyStore.restore(legacyEvents, { atSeq: 50 })
+  assertTrue(legacyRestore.restored.includes('legacy.txt'), 'legacy blob restored successfully')
+  assertEqual(await readFile(join(legacyWs, 'legacy.txt'), 'utf8'), 'legacy content\n', 'legacy content matches')
+
   console.log('checkpoints.test.mjs: all assertions passed ✓')
 } finally {
   await rm(base, { recursive: true, force: true })

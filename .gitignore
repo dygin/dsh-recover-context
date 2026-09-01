@@ -4,3 +4,4 @@ lib/
 *.tsbuildinfo
 .DS_Store
 *.tgz
+.zcode/

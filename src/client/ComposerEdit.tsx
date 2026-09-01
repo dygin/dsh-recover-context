@@ -1,9 +1,8 @@
 /**
- * Composer tool-row affordance: when the agent is still answering the last
- * question (the premature-submit case), offer "edit this question" so the
- * user can pull it back into the composer, edit and resubmit — replacing the
- * wrong context instead of waiting for an answer they no longer want.
- * Registered into the `conversation.input.left` list slot.
+ * 输入框工具栏操作组件：
+ * 当 Agent 仍在回答上一问题时（误提交场景），提供“编辑此问题”按钮，
+ * 用户可将问题拉回输入框修改重发 — 取代错误上下文，而无需苦等不再需要的回答生成完毕。
+ * 注册至 `conversation.input.left` 插槽。
  */
 import { useState } from 'react'
 import type { ClientContext } from './actions.ts'
@@ -11,15 +10,15 @@ import { beginEdit } from './actions.ts'
 import { t } from './locales.ts'
 import { analyzeComposerEdit, type SnapshotLike } from './snapshot.ts'
 
-/** Owner (InputZone) + inject shares of the input.left entry. */
+/** 输入框左侧插槽属性 */
 export interface ComposerEditProps {
-  /** Owner share: point-in-time conversation snapshot. */
+  /** 会话快照 */
   session: SnapshotLike
-  /** Inject share (session-scope slots receive the session id). */
+  /** 会话 ID */
   sessionId: string
 }
 
-/** Pencil glyph. */
+/** 铅笔图标 */
 function EditIcon(): JSX.Element {
   return (
     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
@@ -45,12 +44,12 @@ const style: React.CSSProperties = {
   cursor: 'pointer',
 }
 
-/** Public face: surfaces render-time crashes on the debug badge. */
+/** 包装组件：隔离捕获渲染异常 */
 export function ComposerEdit(props: ComposerEditProps & { ctx: ClientContext }): JSX.Element | null {
   try {
     return ComposerEditInner(props)
   } catch (error) {
-    console.error('[dsh-recover-context] composer render error:', error)
+    console.error('[dsh-recover-context] composer 渲染错误:', error)
     return null
   }
 }
@@ -68,9 +67,7 @@ function ComposerEditInner(props: ComposerEditProps & { ctx: ClientContext }): J
     setBusy(true)
     setError('')
     try {
-      // Deferred edit: loads the question into the composer and arms the
-      // submit interceptor; the context cut happens only on actual submit,
-      // so a refresh before submit leaves the conversation untouched.
+      // 延迟编辑模式：载入问题到输入框并装载提交拦截器
       await beginEdit(ctx, sessionId, info.userText, info.boundarySeq)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))

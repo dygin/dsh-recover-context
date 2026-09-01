@@ -1,16 +1,10 @@
 /**
- * Icon-only action row rendered UNDER each user question:
+ * 用户问题下方的纯图标操作行组件：
  *
- *   - ↶ undo icon — roll back before this question (discard the question and
- *     everything after it, context AND workspace files). Two-step: first
- *     click arms a red ✓ confirm, second click executes.
- *   - ✎ pencil icon — edit this question (only on the most recent one):
- *     loads the text into the composer and arms the submit interceptor; the
- *     cut happens only when the user actually submits (a refresh before
- *     submit leaves the conversation untouched).
- *
- * Rendered by the plugin's own `recover-actions` conversation node kind,
- * registered into the keyed `conversation.chat.node` slot.
+ *   - ↶ 回退图标 — 回退到该问题提出前（丢弃该问题及其之后的所有对话上下文和工作区文件）。
+ *     二次确认设计：首次点击切换为红色 ✓ 确认按钮，再次点击执行。
+ *   - ✎ 编辑图标 — 编辑该问题（仅在最新问题提供）：
+ *     将文本载入输入框并装载提交拦截器；只有用户实际点击提交时才触发截断。
  */
 import { useEffect, useRef, useState } from 'react'
 import type { ClientContext } from './actions.ts'
@@ -18,7 +12,7 @@ import { beginEdit, rollbackBefore } from './actions.ts'
 import { t } from './locales.ts'
 import { analyzeQuestion, type SnapshotLike } from './snapshot.ts'
 
-/** Keyed-slot props for the recover-actions renderer. */
+/** 问题操作行属性定义 */
 export interface QuestionActionsProps {
   node: {
     key: string
@@ -29,7 +23,7 @@ export interface QuestionActionsProps {
   sessionId: string
 }
 
-/** Undo/rewind glyph. */
+/** 撤销/回滚图标 */
 function UndoIcon(): JSX.Element {
   return (
     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
@@ -40,7 +34,7 @@ function UndoIcon(): JSX.Element {
   )
 }
 
-/** Pencil glyph. */
+/** 编辑铅笔图标 */
 function EditIcon(): JSX.Element {
   return (
     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
@@ -51,7 +45,7 @@ function EditIcon(): JSX.Element {
   )
 }
 
-/** Checkmark glyph (armed rollback confirmation). */
+/** 勾选确认图标（回滚确认） */
 function CheckIcon(): JSX.Element {
   return (
     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
@@ -64,12 +58,12 @@ function CheckIcon(): JSX.Element {
 const CONFIRM_TIMEOUT_MS = 6000
 let warnedMissingUseSession = false
 
-/** Public face: surfaces render-time crashes on the debug badge. */
+/** 包装组件：隔离捕获渲染异常 */
 export function QuestionActions(props: QuestionActionsProps & { ctx: ClientContext }): JSX.Element | null {
   try {
     return QuestionActionsInner(props)
   } catch (error) {
-    console.error('[dsh-recover-context] question-actions render error:', error)
+    console.error('[dsh-recover-context] question-actions 渲染错误:', error)
     return null
   }
 }
@@ -79,7 +73,7 @@ function QuestionActionsInner(props: QuestionActionsProps & { ctx: ClientContext
   if (typeof useSession !== 'function') {
     if (!warnedMissingUseSession) {
       warnedMissingUseSession = true
-      console.error('[dsh-recover-context] useSession not delivered to the question-actions entry (standard kit missing?)')
+      console.error('[dsh-recover-context] 未获取到 useSession 方法')
     }
     return null
   }
@@ -109,7 +103,6 @@ function QuestionActionsInner(props: QuestionActionsProps & { ctx: ClientContext
     setError('')
     try {
       await rollbackBefore(ctx, sessionId, info.boundarySeq)
-      // navigation switches sessions and unmounts this component
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
       setBusy(false)

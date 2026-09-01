@@ -1,33 +1,29 @@
 /**
- * Client-side orchestration for rollback and edit. Both operations are built
- * on the stock DSH machinery — `session.fork` (the completed-turn prefix
- * fork the built-in fork button already uses) and `workspace.archiveSession`
- * — plus this plugin's host restore API for the "directory records" part:
+ * 客户端回滚与编辑操作编排。
+ * 两项操作均建立在 DSH 原生机制之上 — `session.fork`（原生分叉功能）与 `workspace.archiveSession`（归档旧会话），
+ * 并结合本插件宿主提供的目录快照恢复 API：
  *
- *   rollback / rollbackBefore
- *     cancel any running turn → fork a child cut before the target →
- *     restore the workspace to that checkpoint → archive the old session →
- *     open the child. The user then continues in a clean context.
+ *   rollback / rollbackBefore（回滚）:
+ *     取消当前运行的轮次 → 分叉出目标截断点之前的新会话 →
+ *     恢复工作区到对应检查点 → 归档旧会话 → 打开新子会话。
  *
- *   beginEdit (NEW flow)
- *     does NOT cut anything: it loads the question text into the composer
- *     and arms a prompt interceptor. The cut (fork + restore + archive) runs
- *     ONLY when the user actually submits — a refresh before submit leaves
- *     the conversation untouched.
+ *   beginEdit（编辑问题）:
+ *     点击时不会截断任何上下文：仅将原问题文本载入输入框并装载提交拦截器；
+ *     截断（fork + 恢复 + 归档）仅在用户实际点击提交时触发。
  */
 import { callApi, type RestoreResult } from './api.ts'
 
-/** One prompt submission (structural mirror of ISession.prompt's argument/result). */
+/** 单次提问提交的结构镜像 */
 type PromptContent = readonly { type: string; text?: string }[]
 type PromptResult = { ok: boolean; error?: { code: string; message: string } }
 
-/** Structural mirror of a session binding's session face with a patchable prompt. */
+/** 支持 patch 拦截 prompt 的会话绑定对象镜像 */
 interface PatchableSession {
   cancel(): Promise<unknown>
   prompt(content: PromptContent, mode: string): Promise<PromptResult>
 }
 
-/** Structural mirror of the client context (subset used here). */
+/** 客户端上下文镜像 */
 export interface ClientContext {
   get<T>(key: string): T | undefined
   sessions: {
@@ -48,47 +44,43 @@ export interface ClientContext {
   }
 }
 
-/** Result of a completed rollback/edit operation. */
+/** 恢复操作完成的结果 */
 export interface RecoverOperationResult {
   childId: string
   restore: RestoreResult
 }
 
 /**
- * In-memory armed-edit state per session. Deliberately NOT persisted: a page
- * refresh clears it, so an unsubmitted edit never touches the conversation.
+ * 各会话内存中的编辑就绪状态。故意不持久化：刷新页面自动清除，不破坏原会话。
  */
 const armedEdits = new Map<string, { boundarySeq: number | null }>()
 
-/**
- * Whether a prompt submission is being redirected by an armed edit
- * (exported for tests).
- */
+/** 判断某会话是否处于编辑拦截就绪状态 */
 export function isEditArmed(sessionId: string): boolean {
   return armedEdits.has(sessionId)
 }
 
-/** Best-effort cancel of a running turn (never throws). */
+/** 尽力取消当前运行的轮次（不抛异常） */
 async function cancelIfRunning(ctx: ClientContext, sessionId: string): Promise<void> {
   const binding = ctx.sessions.binding(sessionId)
   if (binding === undefined) return
   try {
     await binding.session.cancel()
   } catch {
-    // best effort — the fork is still safe without it
+    // 尽力取消，即使失败 fork 依然安全
   }
 }
 
-/** Archive the old session (best effort). */
+/** 归档旧会话（尽力而为） */
 async function archive(ctx: ClientContext, sessionId: string): Promise<void> {
   try {
     await ctx.workspaces.archiveSession(sessionId)
   } catch {
-    // archiving is cosmetic — the new session is already what the user sees
+    // 归档属于界面整理，不阻塞新会话
   }
 }
 
-/** Set the composer draft on a session, retrying until its scope materializes. */
+/** 将文本填入会话输入框草稿区（重试直到作用域就绪） */
 async function setDraftOn(ctx: ClientContext, sessionId: string, text: string): Promise<void> {
   const conversation = ctx.get<{
     input: { for(actx: unknown): { setDraft(text: string): void } }
@@ -101,7 +93,7 @@ async function setDraftOn(ctx: ClientContext, sessionId: string, text: string): 
         conversation.input.for(scope).setDraft(text)
         return
       } catch {
-        // input machine not ready yet — retry
+        // 输入框尚未就绪则重试
       }
     }
     await new Promise(resolve => setTimeout(resolve, 50))
@@ -109,11 +101,8 @@ async function setDraftOn(ctx: ClientContext, sessionId: string, text: string): 
 }
 
 /**
- * Shared "cut before a question" operation: fork the session at the previous
- * completed turn (or create a blank child for the very first question),
- * restore the workspace to that point, archive the old session and open the
- * child. Used by both rollback-before-question and edit-question.
- * @param draftText - when set, load it into the child's composer after open.
+ * 通用的“截断到某个问题之前”操作：在上一已完成轮次处分叉（或对首个问题创建空白子会话），
+ * 恢复工作区到该时间点，归档旧会话并打开新子会话。
  */
 async function cutBefore(
   ctx: ClientContext,
@@ -125,9 +114,7 @@ async function cutBefore(
   let childId: string
   let restore: RestoreResult
   if (boundarySeqOrNull === null) {
-    // The very first question: a completed-turn fork is impossible, so create
-    // a fresh blank session on the same workspace and restore the workspace
-    // to its pre-work baseline.
+    // 第一个问题：无法基于已完成轮次 fork，因此创建相同工作区的全新空白会话并还原基线文件
     const cwd = ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd
     const workspace = ctx.workspaces.list.getSnapshot().items.find(item => item.path === cwd)
     childId = await ctx.sessions.create(workspace !== undefined
@@ -146,7 +133,7 @@ async function cutBefore(
   return { childId, restore }
 }
 
-/** Roll back through the turn containing `atSeq`, restore files, archive the old session, open the child. */
+/** 回滚到包含 atSeq 的轮次完成状态，恢复文件，归档旧会话，打开子会话 */
 export async function rollback(
   ctx: ClientContext,
   sessionId: string,
@@ -161,8 +148,7 @@ export async function rollback(
 }
 
 /**
- * Roll back BEFORE one question: discard the question and everything after it
- * (context and workspace files), archive the old session, open the child.
+ * 回滚到某个问题提出之前：丢弃该问题及其之后的所有上下文与文件变更
  */
 export async function rollbackBefore(
   ctx: ClientContext,
@@ -172,18 +158,13 @@ export async function rollbackBefore(
   return cutBefore(ctx, sessionId, boundarySeqOrNull)
 }
 
-/** Preview the restore counts for a rollback point (dry run). */
+/** 预检恢复文件数量（dryRun 试运行） */
 export function previewRestore(sessionId: string, atSeq: number): Promise<RestoreResult> {
   return callApi<RestoreResult>('restore', { sessionId, atSeq, dryRun: true })
 }
 
 /**
- * Begin editing the last question WITHOUT touching the conversation: loads
- * the question text into the composer and arms a prompt interceptor that
- * will, on the NEXT submit, cut the conversation before the question (fork /
- * restore / archive), open the child and deliver the submitted content to
- * it. A page refresh before submit clears the arming and leaves the
- * conversation completely untouched.
+ * 进入编辑模式：将问题填入输入框并装载提交拦截器，截断操作推迟到提交时执行
  */
 export async function beginEdit(
   ctx: ClientContext,
@@ -197,7 +178,7 @@ export async function beginEdit(
   }
 }
 
-/** Wrap one session's prompt once; armed edits redirect the next submit. */
+/** 包装会话的 prompt 提问方法，以便在用户下一次提交时重定向到新分叉的子会话 */
 function armEditInterceptor(
   ctx: ClientContext,
   sessionId: string,
@@ -218,7 +199,7 @@ function armEditInterceptor(
       const { childId } = await cutBefore(ctx, sessionId, armed.boundarySeq)
       const child = await resolveChildBinding(ctx, childId)
       if (child === undefined) {
-        return { ok: false, error: { code: 'internal', message: 'edit: child session unavailable' } }
+        return { ok: false, error: { code: 'internal', message: '编辑失败：子会话不可用' } }
       }
       return child.session.prompt(content, mode)
     } catch (error) {
@@ -227,7 +208,7 @@ function armEditInterceptor(
   }
 }
 
-/** Resolve the child's binding with a short retry (it materializes on fork/open). */
+/** 解析子会话绑定（重试直到会话绑定就绪） */
 async function resolveChildBinding(
   ctx: ClientContext,
   childId: string,

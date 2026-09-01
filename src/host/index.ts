@@ -1,22 +1,18 @@
 /**
- * dsh-recover-context host half.
+ * dsh-recover-context 宿主端入口。
  *
- * Two responsibilities:
- *  1. Workspace checkpointing — subscribes to the session append feed and
- *     records the session's working directory at the baseline (first
- *     observed event) and after every completed turn, so a rollback can
- *     restore the files the agent produced in the turns being discarded.
- *  2. The /recover-context JSON API — checkpoint listing and workspace
- *     restore. The conversation rollback itself (fork + archive + navigate)
- *     is orchestrated by the client half through the stock session.fork and
- *     workspace.archiveSession RPCs; this host half supplies the missing
- *     "directory records" piece.
+ * 两大核心职责：
+ *  1. 工作区检查点采集 — 监听会话事件流（session/event），在基线时刻（首次观察到事件）
+ *     以及每个轮次完成时（turn/end）记录工作区目录状态，确保在回滚时能精准还原被撤销轮次产生的文件变更。
+ *  2. /recover-context JSON API — 提供检查点查询列表与工作区恢复还原接口。
+ *     会话本身的对话回滚由前端客户端基于原生 session.fork 与 workspace.archiveSession 完成，
+ *     宿主端补充对应的工作区目录状态还原能力。
  *
- * Storage lives under the DSH home (never inside the workspace):
+ * 存储路径（位于 DSH 主目录下，绝不污染用户工作区）：
  *   <dshHome>/storages/recover-context/<sessionId>/baseline.json
  *   <dshHome>/storages/recover-context/<sessionId>/turn-<n>.json
- * An optional <dshHome>/storages/recover-context/config.json can override
- * the tracker defaults (see CheckpointOptions).
+ *   <dshHome>/storages/recover-context/<sessionId>/blobs/<sha>
+ * 可通过 <dshHome>/storages/recover-context/config.json 覆盖追踪器默认配置。
  */
 import { mkdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -27,41 +23,41 @@ import {
   readJsonBody, requireString, writeError, writeJson, writeOk,
 } from './wire.ts'
 
-/** Plugin identity for cordis.yml rows. */
+/** 插件名称 */
 export const name = 'dsh-recover-context'
 
-/** Services required before mounting. */
+/** 挂载前依赖注入的服务 */
 export const inject = ['webServer', 'sessions', 'webRuntime']
 
-// Re-export the engine so consumers and tests can exercise it standalone.
-export { CheckpointStore, isIgnored, walkWorkspace } from './checkpoints.ts'
-export type { Checkpoint, CheckpointOptions, RestoreResult, TrackedFile } from './checkpoints.ts'
+// 重新导出引擎核心实现，便于外部消费者与独立测试直接使用
+export { CheckpointStore, isIgnored, walkWorkspace, parseGitignore, matchesGitignore, hashFile, writeAtomic } from './checkpoints.ts'
+export type { Checkpoint, CheckpointOptions, RestoreResult, TrackedFile, GitignoreRule } from './checkpoints.ts'
 
-/** Structural mirror of the session store face this plugin touches. */
+/** 会话存储对象的结构镜像 */
 interface SessionLike {
   id: string
   header: { cwd?: string; origin?: 'subagent'; id: string }
   events: readonly { type: string; seq: number; data?: { turn?: number } }[]
 }
 
-/** Structural mirror of one event row. */
+/** 单个事件行的结构镜像 */
 interface EventLike {
   type: string
   seq: number
   data?: { turn?: number }
 }
 
-/** Structural mirror of the web runtime's trusted-hosts value. */
+/** Web 运行时的信任域结构镜像 */
 interface WebRuntimeLike {
   trustedHosts: readonly string[]
 }
 
-/** Structural mirror of the optional persistence service. */
+/** 可选的会话持久化服务接口镜像 */
 interface PersistenceLike {
   inspect(id: string): Promise<{ meta: { cwd?: string }; events: readonly EventLike[] }>
 }
 
-/** Structural mirror of the host context (subset used here). */
+/** 宿主上下文接口镜像 */
 export interface RecoverContext {
   effect(fn: () => void | (() => void), label?: string): void
   on(event: string, listener: (session: SessionLike, event: EventLike) => void): () => void
@@ -80,19 +76,19 @@ export interface RecoverContext {
   logger: { info(message: string): void; warn(message: string): void }
 }
 
-/** Resolve the DSH home (same precedence as @deepseek-ai/dsh-home-paths). */
+/** 解析 DSH 根主目录路径 */
 function dshHome(): string {
   const env = process.env.DSH_HOME
   if (env !== undefined && env.trim() !== '') return resolve(env)
   return join(homedir(), '.dsh')
 }
 
-/** The plugin's storage root under the DSH home. */
+/** 插件存储在 DSH 下的根目录 */
 function storageRoot(): string {
   return join(dshHome(), 'storages', 'recover-context')
 }
 
-/** Load the optional per-user config.json (defaults when absent/invalid). */
+/** 加载可选的用户全局配置文件 config.json */
 async function loadConfig(): Promise<CheckpointOptions & { enabled?: boolean }> {
   try {
     const raw = await readFile(join(storageRoot(), 'config.json'), 'utf8')
@@ -103,6 +99,9 @@ async function loadConfig(): Promise<CheckpointOptions & { enabled?: boolean }> 
       ...(Array.isArray(parsed.ignorePatterns) ? { ignorePatterns: parsed.ignorePatterns as string[] } : {}),
       ...(typeof parsed.trackSizeCap === 'number' ? { trackSizeCap: parsed.trackSizeCap } : {}),
       ...(typeof parsed.blobSizeCap === 'number' ? { blobSizeCap: parsed.blobSizeCap } : {}),
+      ...(typeof parsed.maxFiles === 'number' ? { maxFiles: parsed.maxFiles } : {}),
+      ...(typeof parsed.maxTotalBlobBytes === 'number' ? { maxTotalBlobBytes: parsed.maxTotalBlobBytes } : {}),
+      ...(typeof parsed.enableGitignore === 'boolean' ? { enableGitignore: parsed.enableGitignore } : {}),
     }
   } catch {
     return { enabled: true }
@@ -110,13 +109,13 @@ async function loadConfig(): Promise<CheckpointOptions & { enabled?: boolean }> 
 }
 
 /**
- * Browser plugin body.
- * @param ctx - host plugin context.
+ * 宿主插件主入口。
+ * @param ctx 宿主插件上下文
  */
 export function apply(ctx: RecoverContext): void {
-  /** Per-session checkpoint stores, keyed by session id. */
+  /** 各会话的快照存储实例字典 */
   const stores = new Map<string, CheckpointStore>()
-  /** Per-session serialization chains (snapshots must not interleave). */
+  /** 各会话的串行化操作 Promise 链（防止并发快照互相交错） */
   const chains = new Map<string, Promise<unknown>>()
   let configPromise: Promise<CheckpointOptions & { enabled?: boolean }> | null = null
 
@@ -125,7 +124,7 @@ export function apply(ctx: RecoverContext): void {
     return configPromise
   }
 
-  /** Serialize one task per session id (fire-and-forget errors logged). */
+  /** 串行化执行单个会话的操作队列 */
   function enqueue<T>(sessionId: string, task: () => Promise<T>): Promise<T | undefined> {
     const previous = chains.get(sessionId) ?? Promise.resolve()
     const next = previous.then(task, task)
@@ -133,7 +132,7 @@ export function apply(ctx: RecoverContext): void {
     return next
   }
 
-  /** Resolve the workspace root for a session, or undefined when untrackable. */
+  /** 获取指定会话的工作区根目录 */
   async function workspaceRootOf(sessionId: string): Promise<string | undefined> {
     const live = ctx.sessions.get(sessionId)
     const liveCwd = live?.header.cwd
@@ -148,28 +147,28 @@ export function apply(ctx: RecoverContext): void {
     }
   }
 
-  /** Get or create the checkpoint store for a session. */
+  /** 获取或初始化会话的检查点存储器 */
   async function storeFor(sessionId: string): Promise<CheckpointStore | undefined> {
     const existing = stores.get(sessionId)
     if (existing !== undefined) return existing
     const root = await workspaceRootOf(sessionId)
     if (root === undefined) return undefined
     const dshRoot = dshHome()
-    if (root === dshRoot || root.startsWith(dshRoot + sep)) return undefined // never track the harness home
+    if (root === dshRoot || root.startsWith(dshRoot + sep)) return undefined // 绝不追踪 DSH 自身主目录
     const { enabled, ...options } = await config()
     if (enabled === false) return undefined
     const dir = join(storageRoot(), sessionId)
     await mkdir(dir, { recursive: true })
-    const store = new CheckpointStore(dir, root, options)
+    const store = new CheckpointStore(dir, root, { ...options, logger: ctx.logger })
     stores.set(sessionId, store)
     return store
   }
 
-  /** Session event feed → baseline + per-turn checkpoints. */
+  /** 监听会话事件流 → 自动创建基线与轮次检查点 */
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
       const sessionId = session.header.id ?? session.id
-      if (session.header.origin === 'subagent') return // subagents share cwd with their parent
+      if (session.header.origin === 'subagent') return // 子代理共享父会话的 cwd，不重复采集
       void enqueue(sessionId, async () => {
         const store = await storeFor(sessionId)
         if (store === undefined) return
@@ -179,14 +178,14 @@ export function apply(ctx: RecoverContext): void {
             await store.recordTurn(event.data.turn, event.seq)
           }
         } catch (error) {
-          ctx.logger.warn(`dsh-recover-context: checkpoint failed for ${sessionId}: ${String(error)}`)
+          ctx.logger.warn(`dsh-recover-context: 会话 ${sessionId} 检查点保存失败: ${String(error)}`)
         }
       })
     })
     return off
   }, 'dsh-recover-context: session checkpoint feed')
 
-  /** Read the session's event log (live session preferred, else persistence). */
+  /** 读取会话的事件日志（优先从活跃会话中读取，其次从持久化中读取） */
   async function eventsOf(sessionId: string): Promise<readonly EventLike[]> {
     const live = ctx.sessions.get(sessionId)
     if (live !== undefined) return live.events
@@ -195,14 +194,14 @@ export function apply(ctx: RecoverContext): void {
       try {
         return (await persistence.inspect(sessionId)).events
       } catch {
-        // fall through
+        // 忽略读取错误
       }
     }
     return []
   }
 
   const api = {
-    /** List the checkpoints recorded for one session. */
+    /** 查询某个会话已记录的检查点列表 */
     async checkpoints(payload: unknown): Promise<unknown> {
       const sessionId = requireString(payload, 'sessionId')
       const store = await storeFor(sessionId)
@@ -219,10 +218,8 @@ export function apply(ctx: RecoverContext): void {
     },
 
     /**
-     * Restore the session's workspace to the recorded state at the rollback
-     * point. `atSeq` anchors the boundary (first turn/end at or after it,
-     * mirroring session.fork); `baseline: true` restores the pre-work state
-     * (used when editing the very first question). `dryRun` only reports.
+     * 将工作区目录还原到回滚点。
+     * atSeq 指定截断锚点；baseline: true 恢复到初始状态；dryRun 仅做预检返回受影响文件清单。
      */
     async restore(payload: unknown): Promise<unknown> {
       const sessionId = requireString(payload, 'sessionId')
@@ -231,16 +228,16 @@ export function apply(ctx: RecoverContext): void {
       const dryRun = optionalBoolean(payload, 'dryRun') ?? false
       const store = await storeFor(sessionId)
       if (store === undefined) {
-        throw new RecoverError('not-found', `no recover-context tracking for session "${sessionId}"`, 404)
+        throw new RecoverError('not-found', `未找到会话 "${sessionId}" 的恢复上下文记录`, 404)
       }
       const events = await eventsOf(sessionId)
       const result = await enqueue(sessionId, async () => store.restore(events, { atSeq, baseline, dryRun }))
-      if (result === undefined) throw new RecoverError('internal', 'restore task failed')
+      if (result === undefined) throw new RecoverError('internal', '恢复任务执行失败')
       return result
     },
   }
 
-  // ── JSON API ────────────────────────────────────────────────────────────
+  // ── JSON API 路由注册 ──────────────────────────────────────────────────
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: '/recover-context/api',
@@ -259,14 +256,14 @@ export function apply(ctx: RecoverContext): void {
         ? pathname.slice('/recover-context/api/'.length)
         : undefined
       if (method === undefined || method.includes('/')) {
-        writeError(res as never, new RecoverError('not-found', 'unknown recover-context API method', 404))
+        writeError(res as never, new RecoverError('not-found', '未知的 recover-context API 方法', 404))
         return
       }
       try {
         const payload = await readJsonBody(req as never)
         const handler = (api as Record<string, (value: unknown) => Promise<unknown>>)[method]
         if (handler === undefined) {
-          throw new RecoverError('not-found', `unknown recover-context API method "${method}"`, 404)
+          throw new RecoverError('not-found', `未知的 recover-context API 方法 "${method}"`, 404)
         }
         writeOk(res as never, await handler(payload))
       } catch (error) {

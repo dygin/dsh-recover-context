@@ -1,13 +1,11 @@
 /**
- * Wire helpers for the /recover-context JSON API: bounded body reading,
- * response writing, the shared error envelope, and the browser-trust fence
- * (behaviorally identical to the /api gateway's fence — Host-header loopback
- * or a configured trusted authority passes; cross-site browser markers
- * refuse; DNS-rebinding / cross-site defense, not authentication).
+ * /recover-context JSON API 的网络传输辅助方法：
+ * 包括请求体读取限制、响应格式化、统一错误封装，以及浏览器信任域防御
+ * （逻辑与 /api 网关防御一致：校验 Loopback 主机头或已配置的信任域名；拒绝跨站跨域请求）。
  */
 import type { IncomingHttpHeaders } from 'node:http'
 
-/** Machine-readable error codes of the recover-context API. */
+/** recover-context API 的机器可读错误码 */
 export type RecoverErrorCode =
   | 'bad-request'
   | 'not-found'
@@ -15,7 +13,7 @@ export type RecoverErrorCode =
   | 'method-error'
   | 'internal'
 
-/** One API failure with its wire code and HTTP status. */
+/** 包含 HTTP 状态码与错误码的 API 错误异常类 */
 export class RecoverError extends Error {
   constructor(
     readonly code: RecoverErrorCode,
@@ -28,7 +26,7 @@ export class RecoverError extends Error {
 
 const MAX_BODY_BYTES = 1 << 20
 
-/** Read and parse the JSON request body (bounded; malformed → bad-request). */
+/** 读取并解析 JSON 请求体（受限于 1MB；格式错误抛出 bad-request） */
 export async function readJsonBody(req: {
   [Symbol.asyncIterator](): AsyncIterator<string | Uint8Array>
 }): Promise<unknown> {
@@ -37,7 +35,7 @@ export async function readJsonBody(req: {
   for await (const chunk of req) {
     const buffer = Buffer.from(chunk)
     total += buffer.length
-    if (total > MAX_BODY_BYTES) throw new RecoverError('bad-request', 'request body too large')
+    if (total > MAX_BODY_BYTES) throw new RecoverError('bad-request', '请求体超出大小限制')
     chunks.push(buffer)
   }
   const text = Buffer.concat(chunks).toString('utf8')
@@ -45,11 +43,11 @@ export async function readJsonBody(req: {
   try {
     return JSON.parse(text) as unknown
   } catch {
-    throw new RecoverError('bad-request', 'request body is not valid JSON')
+    throw new RecoverError('bad-request', '请求体不是合法的 JSON')
   }
 }
 
-/** Write a JSON response with the given status. */
+/** 写入指定状态码的 JSON 响应 */
 export function writeJson(
   res: { writeHead(status: number, headers?: Record<string, string>): void; end(body?: string): void },
   status: number,
@@ -59,12 +57,12 @@ export function writeJson(
   res.end(JSON.stringify(body))
 }
 
-/** Write the success envelope. */
+/** 写入成功响应信封 { ok: true, value } */
 export function writeOk(res: Parameters<typeof writeJson>[0], value: unknown): void {
   writeJson(res, 200, { ok: true, value })
 }
 
-/** Write the failure envelope for any thrown value. */
+/** 写入失败响应信封 */
 export function writeError(res: Parameters<typeof writeJson>[0], error: unknown): void {
   if (error instanceof RecoverError) {
     writeJson(res, error.status, { ok: false, error: { code: error.code, message: error.message } })
@@ -74,37 +72,37 @@ export function writeError(res: Parameters<typeof writeJson>[0], error: unknown)
   writeJson(res, 500, { ok: false, error: { code: 'internal', message } })
 }
 
-/** Narrow an unknown payload value to a string, else throw bad-request. */
+/** 校验并提取载荷中的必填字符串字段 */
 export function requireString(payload: unknown, key: string): string {
   const record = payload as Record<string, unknown> | null
   const value = record?.[key]
   if (typeof value !== 'string' || value === '') {
-    throw new RecoverError('bad-request', `missing or invalid "${key}"`)
+    throw new RecoverError('bad-request', `缺少或无效的字段 "${key}"`)
   }
   return value
 }
 
-/** Narrow an unknown payload value to an optional number. */
+/** 提取可选的数值字段 */
 export function optionalNumber(payload: unknown, key: string): number | undefined {
   const record = payload as Record<string, unknown> | null
   const value = record?.[key]
   if (value === undefined || value === null) return undefined
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new RecoverError('bad-request', `invalid "${key}"`)
+    throw new RecoverError('bad-request', `无效的数值字段 "${key}"`)
   }
   return value
 }
 
-/** Narrow an unknown payload value to an optional boolean. */
+/** 提取可选的布尔字段 */
 export function optionalBoolean(payload: unknown, key: string): boolean | undefined {
   const record = payload as Record<string, unknown> | null
   const value = record?.[key]
   if (value === undefined || value === null) return undefined
-  if (typeof value !== 'boolean') throw new RecoverError('bad-request', `invalid "${key}"`)
+  if (typeof value !== 'boolean') throw new RecoverError('bad-request', `无效的布尔字段 "${key}"`)
   return value
 }
 
-// ---- trust fence (copied from the /api gateway semantics) ----------------
+// ---- 信任域防护校验 --------------------------------------------------------
 
 function header(headers: IncomingHttpHeaders, name: string): string | undefined {
   const value = headers[name]
@@ -119,7 +117,7 @@ function parseAuthority(authority: string): URL | undefined {
   }
 }
 
-/** Whether a normalized URL hostname names the local loopback authority. */
+/** 判断主机名是否为本地回环地址 */
 export function isLoopbackHostname(hostname: string): boolean {
   if (hostname === 'localhost' || hostname === '[::1]') return true
   const parts = hostname.split('.')
@@ -144,9 +142,7 @@ function isTrustedAuthority(hostUrl: URL, trustedHosts: readonly string[]): bool
 }
 
 /**
- * Decide whether one request may reach the plugin routes.
- * @param request - node HTTP request facts (headers).
- * @param trustedHosts - non-loopback authorities this deployment serves.
+ * 判断请求是否允许访问插件的内部 API 路由
  */
 export function isTrustedApiRequest(
   request: { headers: IncomingHttpHeaders },
