@@ -448,6 +448,77 @@ try {
     assertTrue(await exists(join(chainWs, 'a.txt')) === true, '被继承轮次的 a.txt 应保留')
   }
 
+  // ── 跨会话遗留产物：上一个对话留下的 1.txt 必须能被下一个会话回退掉 ──────
+  // 用户场景：会话 A 产出 1.txt 后结束；工作区里留下 1.txt；
+  // 用户新开会话 B（基线自然包含 1.txt），在 B 里编辑/回退到基线时，
+  // 期望 1.txt 被清除——而不是因为"它在基线里"就被永久保留。
+  {
+    const crossWs = join(base, 'ws-cross')
+    const ledger = join(base, 'ledger-cross.json')
+    await mkdir(crossWs, { recursive: true })
+    await writeFile(join(crossWs, 'keep.txt'), 'base\n')
+
+    // 会话 A：基线干净，第 1 轮产出 1.txt
+    const sessionA = new CheckpointStore(join(base, 'data-cross-a'), crossWs, {
+      ledgerPath: ledger,
+      sessionId: 'session-A',
+    })
+    await sessionA.ensureBaseline()
+    await writeFile(join(crossWs, '1.txt'), 'today\n')
+    await sessionA.recordTurn(1, 20)
+
+    // 会话 B：新会话，此时工作区里还留着 A 的 1.txt
+    const sessionB = new CheckpointStore(join(base, 'data-cross-b'), crossWs, {
+      ledgerPath: ledger,
+      sessionId: 'session-B',
+    })
+    const baselineB = await sessionB.ensureBaseline()
+    assertTrue('1.txt' in baselineB.files, '新会话的基线确实包含遗留的 1.txt')
+    assertTrue(
+      (baselineB.leftovers ?? {})['1.txt'] !== undefined,
+      '基线应把 1.txt 标记为「上一个对话遗留的产物」',
+    )
+
+    // B 产出 2.txt
+    await writeFile(join(crossWs, '2.txt'), 'world\n')
+    await sessionB.recordTurn(1, 40)
+
+    // 回退到 B 的基线：1.txt（遗留产物）与 2.txt（B 的产物）都应删除
+    const r = await sessionB.restore([], { baseline: true })
+    assertTrue(r.deleted.includes('2.txt'), '本会话产物 2.txt 应删除')
+    assertTrue(r.deleted.includes('1.txt'), '上一个对话遗留的 1.txt 也应删除')
+    assertTrue(await exists(join(crossWs, '1.txt')) === false, '1.txt 已从磁盘删除')
+    assertTrue(await exists(join(crossWs, '2.txt')) === false, '2.txt 已从磁盘删除')
+    assertEqual(await readFile(join(crossWs, 'keep.txt'), 'utf8'), 'base\n', '用户文件保留')
+
+    // 遗留产物被改动过 → 不再删除（视为用户资产）
+    // 让会话 A 先产出一个文件并记入台账
+    const sessionA2 = new CheckpointStore(join(base, 'data-cross-a2'), crossWs, {
+      ledgerPath: ledger,
+      sessionId: 'session-A2',
+    })
+    await sessionA2.ensureBaseline()
+    await writeFile(join(crossWs, '3.txt'), 'agent output\n')
+    await sessionA2.recordTurn(1, 50)
+
+    // 用户手动改了它
+    await writeFile(join(crossWs, '3.txt'), 'user edited this\n')
+
+    // 新会话 C：基线里 3.txt 的 sha 与台账不同 → 不应被标记为遗留产物
+    const sessionC = new CheckpointStore(join(base, 'data-cross-c'), crossWs, {
+      ledgerPath: ledger,
+      sessionId: 'session-C',
+    })
+    const baselineC = await sessionC.ensureBaseline()
+    assertTrue(
+      (baselineC.leftovers ?? {})['3.txt'] === undefined,
+      '内容被改过的文件不得标记为遗留产物',
+    )
+    const c = await sessionC.restore([], { baseline: true })
+    assertTrue(!c.deleted.includes('3.txt'), '被改动过的文件不得当作产物删除')
+    assertEqual(await readFile(join(crossWs, '3.txt'), 'utf8'), 'user edited this\n', '用户改动保留')
+  }
+
   console.log('checkpoints.test.mjs: all assertions passed ✓')
 } finally {
   await rm(base, { recursive: true, force: true })

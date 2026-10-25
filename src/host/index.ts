@@ -17,6 +17,7 @@
  * 可通过 <dshHome>/storages/recover-context/config.json 覆盖追踪器默认配置。
  */
 import { mkdir, readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { CheckpointStore, RestoreUnavailableError, type CheckpointOptions } from './checkpoints.ts'
@@ -111,6 +112,17 @@ function storageRoot(): string {
   return join(dshHome(), 'storages', 'recover-context')
 }
 
+/**
+ * 工作区级产物台账的文件路径。
+ *
+ * 台账按工作区（而不是按会话）存放：跨会话才能识别"上一个对话遗留的产物"。
+ * 路径以工作区绝对路径的哈希命名，避免不同工作区互相干扰。
+ */
+function ledgerPathFor(workspaceRoot: string): string {
+  const digest = createHash('sha256').update(resolve(workspaceRoot)).digest('hex').slice(0, 16)
+  return join(storageRoot(), 'workspaces', `${digest}.json`)
+}
+
 /** 加载可选的用户全局配置文件 config.json */
 async function loadConfig(): Promise<CheckpointOptions & { enabled?: boolean }> {
   try {
@@ -125,6 +137,9 @@ async function loadConfig(): Promise<CheckpointOptions & { enabled?: boolean }> 
       ...(typeof parsed.maxFiles === 'number' ? { maxFiles: parsed.maxFiles } : {}),
       ...(typeof parsed.maxTotalBlobBytes === 'number' ? { maxTotalBlobBytes: parsed.maxTotalBlobBytes } : {}),
       ...(typeof parsed.enableGitignore === 'boolean' ? { enableGitignore: parsed.enableGitignore } : {}),
+      ...(typeof parsed.cleanupPreviousArtifacts === 'boolean'
+        ? { cleanupPreviousArtifacts: parsed.cleanupPreviousArtifacts }
+        : {}),
     }
   } catch {
     return { enabled: true }
@@ -193,7 +208,16 @@ export function apply(ctx: RecoverContext): void {
     if (enabled === false) return undefined
     const dir = join(storageRoot(), sessionId)
     await mkdir(dir, { recursive: true })
-    const store = new CheckpointStore(dir, root, { ...options, logger: ctx.logger })
+    const store = new CheckpointStore(dir, root, {
+      ...options,
+      logger: ctx.logger,
+      // 工作区级产物台账：记录本插件各会话产出过哪些文件。
+      // 它让"上一个对话遗留的 1.txt"能在下一个会话回退/编辑时被正确清理，
+      // 而不是因为出现在基线里就被当成用户自有文件永久保留。
+      ledgerPath: ledgerPathFor(root),
+      sessionId,
+      cleanupPreviousArtifacts: options.cleanupPreviousArtifacts ?? true,
+    })
     stores.set(sessionId, store)
     return store
   }

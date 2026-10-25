@@ -38,6 +38,23 @@ export const NEVER_SCAN_IGNORED_DIRS = [
 /** 默认追踪的文件体积上限：超过则只记 size+mtime（不计算哈希、不备份内容） */
 export const DEFAULT_TRACK_SIZE_CAP = 100 * 1024 * 1024
 
+/** 台账中的一条产物记录 */
+export interface LedgerEntry {
+  /** 产出时的内容哈希；文件被改动后不再等同于台账值 */
+  sha: string
+  size: number
+  /** 产出时间（epoch ms） */
+  createdAt: number
+  /** 产出它的会话 id */
+  sessionId: string
+}
+
+/** 工作区级产物台账：记录「本插件某个会话产出过哪些文件」 */
+export interface LedgerFile {
+  version: 1
+  artifacts: Record<string, LedgerEntry>
+}
+
 /** 默认永不追踪的文件名通配规则 */
 export const DEFAULT_IGNORE_PATTERNS = ['*.pyc', '*.pyo', '*.log', '*.tmp', '*.swp']
 
@@ -85,6 +102,14 @@ export interface Checkpoint {
   ignored?: Record<string, { size: number; mtimeMs: number }>
   /** 被忽略路径索引是否因数量上限被截断；截断时回退不做被忽略路径清理（安全优先） */
   ignoredTruncated?: boolean
+  /**
+   * 会话开始前就存在、但**由本插件此前的对话产出**的文件（相对路径 → 当时的 sha）。
+   *
+   * 这类文件是"上一个对话的产物"，用户回退/编辑到基线时理应一并清掉；
+   * 但它们确实存在于基线里，若不做区分就会被当成用户自己的文件而保留下来。
+   * 只在 sha 与记录一致（此后未被改动）时才删除，改动过的仍按普通文件还原。
+   */
+  leftovers?: Record<string, string>
 }
 
 export interface CheckpointOptions {
@@ -99,6 +124,23 @@ export interface CheckpointOptions {
    * 只有显式设为有限值时才存在此限制；被限制的文件在回退时会被跳过并上报。
    */
   blobSizeCap?: number
+  /**
+   * 工作区级产物台账路径。
+   *
+   * 台账记录「本插件某个会话产出过哪些文件」。它解决的是跨会话场景：
+   * 上一轮对话留下的 `1.txt` 会出现在下一个会话的基线里，若不区分，
+   * 用户回退/编辑到基线时就会把它当成自己的文件而保留——正是"产物没删掉"的根因。
+   *
+   * 为 undefined 时不启用台账（行为退化为纯按会话判断）。
+   */
+  ledgerPath?: string
+  /** 本存储对应的会话 id（写入台账时标注来源） */
+  sessionId?: string
+  /**
+   * 回退/编辑到基线时，是否清理「上一个对话遗留的产物」。
+   * 默认 true；只有内容与台账记录完全一致（未被改动）时才会删除。
+   */
+  cleanupPreviousArtifacts?: boolean
   /** 单个工作区最大扫描追踪文件数量上限（防止超大目录死循环） */
   maxFiles?: number
   /** 单个会话保存的所有 Blob 总字节上限 */
@@ -492,12 +534,16 @@ function changedBlobs(
 export class CheckpointStore {
   private readonly dir: string
   private readonly root: string
-  private readonly options: Required<Omit<CheckpointOptions, 'blobSizeCap'>> & { blobSizeCap: number }
+  private readonly options: Required<Omit<CheckpointOptions, 'blobSizeCap' | 'ledgerPath' | 'sessionId' | 'cleanupPreviousArtifacts'>>
+    & Pick<CheckpointOptions, 'ledgerPath' | 'sessionId'>
+    & { blobSizeCap: number; cleanupPreviousArtifacts: boolean }
   private baselineLoaded = false
   private baseline: Checkpoint | undefined
   private turnsLoaded = false
   private turns: Map<number, Checkpoint> = new Map()
   private totalBlobBytes = 0
+  private ledgerLoaded = false
+  private ledger: LedgerFile = { version: 1, artifacts: {} }
 
   constructor(dataDir: string, workspaceRoot: string, options: CheckpointOptions = {}) {
     this.dir = dataDir
@@ -514,6 +560,9 @@ export class CheckpointStore {
       enableGitignore: options.enableGitignore ?? true,
       ioConcurrency: options.ioConcurrency ?? 8,
       logger: options.logger ?? {},
+      ledgerPath: options.ledgerPath,
+      sessionId: options.sessionId,
+      cleanupPreviousArtifacts: options.cleanupPreviousArtifacts ?? true,
     }
   }
 
@@ -524,6 +573,82 @@ export class CheckpointStore {
   /** 本会话快照数据的存放目录（供 fork 后继承父会话历史使用）。 */
   get storageDir(): string {
     return this.dir
+  }
+
+  // ── 工作区级产物台账 ──────────────────────────────────────────────────
+
+  /** 加载台账（惰性，失败时退化为空台账）。 */
+  private async loadLedger(): Promise<void> {
+    if (this.ledgerLoaded) return
+    this.ledgerLoaded = true
+    if (this.options.ledgerPath === undefined) return
+    try {
+      const raw = JSON.parse(await readFile(this.options.ledgerPath, 'utf8')) as LedgerFile
+      if (raw !== null && typeof raw === 'object' && raw.artifacts !== null && typeof raw.artifacts === 'object') {
+        this.ledger = { version: 1, artifacts: raw.artifacts }
+      }
+    } catch {
+      // 无台账或已损坏 → 使用空台账
+    }
+  }
+
+  /** 持久化台账（原子写）。 */
+  private async saveLedger(): Promise<void> {
+    if (this.options.ledgerPath === undefined) return
+    try {
+      await writeAtomic(this.options.ledgerPath, JSON.stringify(this.ledger))
+    } catch (error) {
+      this.options.logger.warn?.(`[dsh-recover-context] 产物台账写入失败: ${String(error)}`)
+    }
+  }
+
+  /**
+   * 记录一个由本轮新产出的文件。
+   * 只有「本轮之前不存在」的文件才会入账——被修改的老文件属于用户资产，不入账。
+   */
+  private async markArtifact(rel: string, sha: string, size: number): Promise<void> {
+    if (this.options.ledgerPath === undefined) return
+    await this.loadLedger()
+    const existing = this.ledger.artifacts[rel]
+    // 同一内容重复入账时保留最早的产出记录
+    if (existing !== undefined && existing.sha === sha) return
+    this.ledger.artifacts[rel] = {
+      sha,
+      size,
+      createdAt: Date.now(),
+      sessionId: this.options.sessionId ?? '',
+    }
+    await this.saveLedger()
+  }
+
+  /** 文件已被删除/还原后，从台账移除（避免台账无限增长）。 */
+  private async forgetArtifact(rel: string): Promise<void> {
+    if (this.options.ledgerPath === undefined) return
+    await this.loadLedger()
+    if (this.ledger.artifacts[rel] === undefined) return
+    delete this.ledger.artifacts[rel]
+    await this.saveLedger()
+  }
+
+  /**
+   * 找出「会话开始前就存在、但由此前对话产出」的文件。
+   * 仅当内容与台账记录完全一致时才算——被用户/其他进程改过的文件不算遗留产物。
+   */
+  private async findLeftovers(
+    files: Record<string, TrackedFile>,
+  ): Promise<Record<string, string>> {
+    if (this.options.ledgerPath === undefined || !this.options.cleanupPreviousArtifacts) return {}
+    await this.loadLedger()
+    const leftovers: Record<string, string> = {}
+    for (const [rel, entry] of Object.entries(this.ledger.artifacts)) {
+      const present = files[rel]
+      if (present === undefined || present.sha === undefined) continue
+      if (present.sha !== entry.sha) continue
+      // 本会话自己产出的不算"上一个对话的遗留"
+      if (entry.sessionId !== '' && entry.sessionId === this.options.sessionId) continue
+      leftovers[rel] = present.sha
+    }
+    return leftovers
   }
 
   /** 清空内存缓存，使下次读取重新从磁盘加载（继承/重建后使用）。 */
@@ -794,6 +919,15 @@ export class CheckpointStore {
     // 记录被忽略路径的基线存在性：回退时据此只删本会话新增的产物
     const ignoredBaseline = await walkIgnoredPaths(this.root, this.options)
 
+    // 识别「上一个对话遗留的产物」：它们确实在基线里，但由此前会话产出。
+    // 记进 leftovers，回退到基线时才能把它们与用户自有文件区分开。
+    const leftovers = await this.findLeftovers(files)
+    if (Object.keys(leftovers).length > 0) {
+      this.options.logger.info?.(
+        `[dsh-recover-context] 检测到 ${Object.keys(leftovers).length} 个此前对话遗留的产物（${this.root}）`,
+      )
+    }
+
     const baseline: Checkpoint = {
       kind: 'baseline',
       turn: 0,
@@ -804,6 +938,7 @@ export class CheckpointStore {
       ...(late ? { late: true } : {}),
       ignored: ignoredBaseline.entries,
       ...(ignoredBaseline.truncated ? { ignoredTruncated: true } : {}),
+      ...(Object.keys(leftovers).length === 0 ? {} : { leftovers }),
     }
     await writeAtomic(this.baselinePath(), JSON.stringify(baseline))
     this.baseline = baseline
@@ -886,6 +1021,21 @@ export class CheckpointStore {
     await runPool(changed, this.options.ioConcurrency, async ([rel, file]) => {
       await this.saveBlob(file.sha as string, join(this.root, rel), file.size)
     })
+
+    // 把「本轮新产出」的文件记入工作区台账。
+    // 只记相对上一快照新增的路径：改动的老文件属于用户资产，不应被未来的会话当成遗留产物清掉。
+    const previousFiles = previous?.files
+    for (const [rel, file] of Object.entries(files)) {
+      if (file.sha === undefined) continue
+      const before = previousFiles?.[rel]
+      if (before !== undefined) continue
+      await this.markArtifact(rel, file.sha, file.size)
+    }
+    // 本轮删除了此前产出的文件 → 从台账移除
+    for (const rel of Object.keys(previousFiles ?? {})) {
+      if (files[rel] !== undefined) continue
+      await this.forgetArtifact(rel)
+    }
 
     // 逐轮同样记录被忽略路径的存在性（内容不备份），供回退时判断新增产物
     const ignoredSnapshot = await walkIgnoredPaths(this.root, this.options)
@@ -1020,6 +1170,22 @@ export class CheckpointStore {
     const checkpoint = target.checkpoint
     const current = await walkWorkspace(this.root, this.options)
 
+    // 回退到基线时，还要清掉「上一个对话遗留的产物」。
+    // 这些文件确实在基线里（所以不会被上面的"当前有、目标无"逻辑处理），
+    // 但它们由此前会话产出——用户回退/编辑到基线正是想让工作区回到"这次对话开始前"，
+    // 上一个对话的产物理应一并消失。只有内容与台账记录一致（未被改动）时才删除。
+    const staleArtifacts = new Set<string>()
+    if (checkpoint === this.baseline && this.options.cleanupPreviousArtifacts) {
+      await this.loadLedger()
+      for (const rel of Object.keys(checkpoint.leftovers ?? {})) {
+        const present = current[rel]
+        // 内容已被改动 → 视为用户资产，不删
+        if (present === undefined || present.sha === undefined) continue
+        if (present.sha !== checkpoint.leftovers?.[rel]) continue
+        staleArtifacts.add(rel)
+      }
+    }
+
     // 被忽略路径（.gitignore / ignoreNames / ignorePatterns）的内容不在 files 索引里，
     // 但 agent 常往这些地方写产物（dist/、*.log 等）。回退时只删除「目标快照里没有、
     // 但现在存在」的被忽略文件；目标快照里已存在的（会话开始前就有的）绝不触碰。
@@ -1070,6 +1236,23 @@ export class CheckpointStore {
       }
     }
 
+    // 1a. 上一个对话遗留、且未被改动的产物 → 删除
+    for (const rel of staleArtifacts) {
+      if (!within(rel)) continue
+      if (dryRun) {
+        deleted.push(rel)
+        continue
+      }
+      try {
+        await rm(absolute(rel), { force: true })
+        await this.forgetArtifact(rel)
+        await pruneEmptyDirs(rel)
+        deleted.push(rel)
+      } catch {
+        skipped.push({ path: rel, reason: 'delete-failed' })
+      }
+    }
+
     // 1. 当前存在但目标快照中不存在的文件 → 删除
     for (const rel of Object.keys(current)) {
       if (checkpoint.files[rel] !== undefined) continue
@@ -1106,6 +1289,8 @@ export class CheckpointStore {
     // 2. 目标快照中存在的文件：若内容不一致则重写还原
     for (const [rel, file] of Object.entries(checkpoint.files)) {
       if (!within(rel)) continue
+      // 已判定为「上一个对话遗留」并删除的文件不再还原，否则又会被写回来
+      if (staleArtifacts.has(rel)) continue
       const present = current[rel]
       const same = present !== undefined && file.sha !== undefined && present.sha === file.sha
       if (same) continue

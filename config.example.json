@@ -6,5 +6,6 @@
   "trackSizeCap": 104857600,
   "maxFiles": 100000,
   "maxTotalBlobBytes": 536870912,
-  "ioConcurrency": 8
+  "ioConcurrency": 8,
+  "cleanupPreviousArtifacts": true
 }

@@ -1,6 +1,6 @@
 # dsh-recover-context
 
-> v1.1.1 · 适配 DeepSeek Harness 0.2.1+
+> v1.1.2 · 适配 DeepSeek Harness 0.2.1+
 
 恢复上下文插件。
 
@@ -38,6 +38,9 @@ blobs/<sha>        按内容寻址（CAS）存储的文件内容
   这正是编辑/回退能可靠撤销本轮产物的前提。
 - **子会话继承父会话历史**：回退后打开的新会话会继承父会话的基线与已完成的逐轮快照，
   因此在其中继续编辑/回退同样能撤销此前轮次的产物，而不是逐层失效。
+- **跨会话识别遗留产物**：插件维护一份工作区级产物台账，记录每个会话产出过哪些文件。
+  上一个对话留在工作区里的产物，会在下一个会话回退/编辑到基线时被一并清除——
+  前提是内容与台账记录完全一致（被改动过的文件视为用户资产，绝不删除）。
 - **还原失败不会静默通过**：目标快照不可用时接口报错、客户端中止流程，绝不出现
   "对话回退了但文件没动"的不一致状态；还原后还会自检文件是否真的已删除。
 - **安全上限**：`maxFiles`（默认 100,000）与 `maxTotalBlobBytes`（默认 512 MiB）防止超大仓库失控。
@@ -56,7 +59,8 @@ blobs/<sha>        按内容寻址（CAS）存储的文件内容
   "trackSizeCap": 104857600,
   "maxFiles": 100000,
   "maxTotalBlobBytes": 536870912,
-  "ioConcurrency": 8
+  "ioConcurrency": 8,
+  "cleanupPreviousArtifacts": true
 }
 ```
 
@@ -71,6 +75,7 @@ blobs/<sha>        按内容寻址（CAS）存储的文件内容
 | `maxFiles` | 扫描文件数上限，超出即停止并告警 |
 | `maxTotalBlobBytes` | 单个会话可备份的 blob 总字节上限 |
 | `ioConcurrency` | 哈希计算与 blob 写入的并发度 |
+| `cleanupPreviousArtifacts` | 回退/编辑到基线时，是否清除上一个对话遗留的产物（默认 `true`；只删内容未被改动过的） |
 
 ## License
 
