@@ -152,93 +152,100 @@ function fakeCtx(overrides: Partial<ClientContext> = {}): ClientContext & { call
 
 const okRestore = (mode: string) => ({ ok: true, value: { mode, restored: ['a'], deleted: ['b'], skipped: [], dryRun: false } })
 
-async function withFetchStub<T>(stub: () => Promise<Response>, run: () => Promise<T>): Promise<T> {
+/**
+ * 安装 fetch stub，并把每次宿主调用记进同一个 calls 日志，
+ * 以便断言「还原」与「fork/创建会话」的相对顺序。
+ */
+function withRestoreStub<T>(
+  calls: string[],
+  mode: string,
+  run: () => Promise<T>,
+): Promise<T> {
   const originalFetch = globalThis.fetch
-  globalThis.fetch = stub as typeof fetch
-  try {
-    return await run()
-  } finally {
-    globalThis.fetch = originalFetch
-  }
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const method = String(url).split('/').pop() ?? ''
+    const body = JSON.parse(String(init?.body ?? '{}')) as {
+      baseline?: boolean
+      atSeq?: number
+      sessionId?: string
+    }
+    if (method === 'resetBaseline') {
+      calls.push(`resetBaseline:${String(body.sessionId)}`)
+      return { json: async () => ({ ok: true, value: { reset: true } }) } as Response
+    }
+    calls.push(`restore:${body.baseline === true ? 'baseline' : `atSeq=${String(body.atSeq)}`}`)
+    return { json: async () => okRestore(mode) } as Response
+  }) as typeof fetch
+  return run().finally(() => { globalThis.fetch = originalFetch }) as Promise<T>
 }
 
-// rollback: cancel → fork(atSeq) → restore → archive → open
+// rollback: cancel → restore → fork(atSeq) → archive → open
+// 还原必须早于 fork：子会话基线在诞生时采集，晚还原会让基线包含残留文件。
 {
   const ctx = fakeCtx()
-  const result = await withFetchStub(
-    async () => ({ json: async () => okRestore('turn') }) as Response,
-    () => rollback(ctx, 's1', 10),
-  )
+  const result = await withRestoreStub(ctx.calls, 'turn', () => rollback(ctx, 's1', 10))
   assert.equal(result.childId, 'child-1')
-  assert.deepEqual(ctx.calls, ['cancel', 'fork:10', 'archive:s1', 'open:child-1'])
+  assert.deepEqual(
+    ctx.calls,
+    ['cancel', 'restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1'],
+    '回退必须先还原工作区，再分叉子会话',
+  )
   assert.equal(result.restore.mode, 'turn')
 }
 
 // rollbackBefore 首个问题：先还原基线，再创建空白会话
 {
   const ctx = fakeCtx()
-  await withFetchStub(
-    async () => ({ json: async () => okRestore('baseline') }) as Response,
-    () => rollbackBefore(ctx, 's1', null),
-  )
+  await withRestoreStub(ctx.calls, 'baseline', () => rollbackBefore(ctx, 's1', null))
   assert.deepEqual(
     ctx.calls,
-    ['cancel', 'connect:w1', 'archive:s1', 'open:child-blank'],
-    '首问回滚应先创建空白子会话，再归档旧会话并打开新会话',
+    ['cancel', 'restore:baseline', 'connect:w1', 'resetBaseline:child-blank', 'archive:s1', 'open:child-blank'],
+    '首问回滚应先还原基线，再创建空白子会话、归档旧会话并打开新会话',
   )
 }
 
 // beginEdit 不截断上下文
 {
   const ctx = fakeCtx()
-  await withFetchStub(
-    async () => ({ json: async () => okRestore('turn') }) as Response,
-    () => beginEdit(ctx, 's1', 'edited question', 10),
-  )
+  await withRestoreStub(ctx.calls, 'turn', () => beginEdit(ctx, 's1', 'edited question', 10))
   assert(isEditArmed('s1'), '编辑拦截已装载')
   assert.deepEqual(ctx.calls, ['draft:edited question'], 'beginEdit 不得截断上下文')
 }
 
-// beginEdit 后提交：截断发生在提交时，内容进入子会话
+// beginEdit 后提交：截断发生在提交时，且还原早于 fork，内容进入子会话
 {
   const ctx = fakeCtx()
-  await withFetchStub(
-    async () => ({ json: async () => okRestore('turn') }) as Response,
-    async () => {
-      await beginEdit(ctx, 's1', 'edited question', 10)
-      assert(isEditArmed('s1'), '提交前处于装载状态')
-      const session = ctx.sessions.binding('s1')!.session as {
-        prompt: (c: unknown, m: unknown) => Promise<{ ok: boolean }>
-      }
-      const result = await session.prompt([{ type: 'text', text: 'edited question' }], 'queue')
-      assert(result.ok, 'prompt 被接受')
-      assert(!isEditArmed('s1'), '提交后装载状态被消费')
-    },
-  )
+  await withRestoreStub(ctx.calls, 'turn', async () => {
+    await beginEdit(ctx, 's1', 'edited question', 10)
+    assert(isEditArmed('s1'), '提交前处于装载状态')
+    const session = ctx.sessions.binding('s1')!.session as {
+      prompt: (c: unknown, m: unknown) => Promise<{ ok: boolean }>
+    }
+    const result = await session.prompt([{ type: 'text', text: 'edited question' }], 'queue')
+    assert(result.ok, 'prompt 被接受')
+    assert(!isEditArmed('s1'), '提交后装载状态被消费')
+  })
   assert.deepEqual(
     ctx.calls,
-    ['draft:edited question', 'cancel', 'fork:10', 'archive:s1', 'open:child-1', 'prompt:[{"type":"text","text":"edited question"}]:queue'],
-    '提交时先截断，再打开子会话并提问',
+    ['draft:edited question', 'cancel', 'restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1', 'prompt:[{"type":"text","text":"edited question"}]:queue'],
+    '提交时必须先还原工作区再分叉，否则子会话基线会记录本轮残留文件',
   )
 }
 
 // 首问编辑提交：空白子会话 + 基线还原
 {
   const ctx = fakeCtx()
-  await withFetchStub(
-    async () => ({ json: async () => okRestore('baseline') }) as Response,
-    async () => {
-      await beginEdit(ctx, 's1', 'edited first question', null)
-      const session = ctx.sessions.binding('s1')!.session as {
-        prompt: (c: unknown, m: unknown) => Promise<{ ok: boolean }>
-      }
-      await session.prompt([{ type: 'text', text: 'edited first question' }], 'queue')
-    },
-  )
+  await withRestoreStub(ctx.calls, 'baseline', async () => {
+    await beginEdit(ctx, 's1', 'edited first question', null)
+    const session = ctx.sessions.binding('s1')!.session as {
+      prompt: (c: unknown, m: unknown) => Promise<{ ok: boolean }>
+    }
+    await session.prompt([{ type: 'text', text: 'edited first question' }], 'queue')
+  })
   assert.deepEqual(
     ctx.calls,
-    ['draft:edited first question', 'cancel', 'connect:w1', 'archive:s1', 'open:child-blank', 'prompt:[{"type":"text","text":"edited first question"}]:queue'],
-    '首问编辑应创建空白子会话并提问',
+    ['draft:edited first question', 'cancel', 'restore:baseline', 'connect:w1', 'resetBaseline:child-blank', 'archive:s1', 'open:child-blank', 'prompt:[{"type":"text","text":"edited first question"}]:queue'],
+    '首问编辑应先还原基线，再创建空白子会话并提问',
   )
 }
 
@@ -255,13 +262,16 @@ async function withFetchStub<T>(stub: () => Promise<Response>, run: () => Promis
 // previewRestore 转发 dryRun 标记
 {
   let seen: unknown = null
-  await withFetchStub(
-    async (_url: RequestInfo | URL, init?: RequestInit) => {
-      seen = init?.body
-      return { json: async () => okRestore('turn') } as Response
-    },
-    () => previewRestore('s1', 7),
-  )
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    seen = init?.body
+    return { json: async () => okRestore('turn') } as Response
+  }) as typeof fetch
+  try {
+    await previewRestore('s1', 7)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
   assert(seen !== null, 'fetch 被调用')
   assert.equal(JSON.parse(String(seen)).dryRun, true, '请求携带 dryRun 标记')
   assert.equal(JSON.parse(String(seen)).atSeq, 7)

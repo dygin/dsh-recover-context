@@ -108,6 +108,56 @@ try {
   const childReal = await child.restore(childEvents, { atSeq: 183 })
   assertEqual(await readFile(join(workspace, 'src', 'app.js'), 'utf8'), 'console.log(1)\n', 'fork-child rollback rewinds the file to the baseline state')
 
+  // ── 回归：子会话基线若在“还原前”采集，会把被丢弃轮次的产物记为基线内容，
+  // 之后在子会话里回退反而会把已删除的文件“复活”。
+  // 正确顺序是「先还原工作区，再分叉」，下面验证该顺序下不会复活。
+  {
+    const staleWs = join(base, 'ws-stale')
+    const parentData = join(base, 'data-stale-parent')
+    const childData2 = join(base, 'data-stale-child')
+    await mkdir(staleWs, { recursive: true })
+    await writeFile(join(staleWs, 'keep.txt'), 'base\n')
+
+    const parentStore = new CheckpointStore(parentData, staleWs)
+    await parentStore.ensureBaseline()
+    // 第 1 轮产出 2.txt
+    await writeFile(join(staleWs, '2.txt'), 'two\n')
+    await parentStore.recordTurn(1, 18)
+    // 第 2 轮产出 3.txt（这就是被编辑/回退轮次的产物）
+    await writeFile(join(staleWs, '3.txt'), 'three\n')
+    await parentStore.recordTurn(2, 28)
+
+    const parentEvents = [
+      { type: 'turn/end', seq: 18, data: { turn: 1 } },
+      { type: 'turn/end', seq: 28, data: { turn: 2 } },
+    ]
+
+    // 正确顺序：先还原到第 1 轮边界，再创建子会话（其基线在此采集）
+    await parentStore.restore(parentEvents, { atSeq: 18 })
+    assertTrue(await exists(join(staleWs, '3.txt')) === false, '还原后本轮产物 3.txt 已删除')
+
+    const childStore = new CheckpointStore(childData2, staleWs)
+    const childBaseline = await childStore.ensureBaseline()
+    assertTrue(
+      !('3.txt' in childBaseline.files),
+      '子会话基线不得包含已被还原删除的 3.txt（否则回退会复活它）',
+    )
+
+    // 子会话继续工作并在完成后回退到它的基线
+    await writeFile(join(staleWs, '4.txt'), 'four\n')
+    await childStore.recordTurn(2, 40)
+    const childEvents2 = [
+      { type: 'turn/end', seq: 18, data: { turn: 1 } },
+      { type: 'turn/end', seq: 40, data: { turn: 2 } },
+    ]
+    const childRollback = await childStore.restore(childEvents2, { atSeq: 18 })
+    assertTrue(await exists(join(staleWs, '4.txt')) === false, '子会话回退应删除其自身轮次的产物')
+    assertTrue(await exists(join(staleWs, '3.txt')) === false, '子会话回退不得复活已丢弃轮次的 3.txt')
+    assertTrue(await exists(join(staleWs, '2.txt')) === true, '边界轮次内产生的 2.txt 应保留')
+    assertEqual(await readFile(join(staleWs, 'keep.txt'), 'utf8'), 'base\n', '原有文件保持完好')
+    void childRollback
+  }
+
   // ── .gitignore support test ──────────────────────────────────────────────
   const gitignoreWs = join(base, 'ws-gitignore')
   const gitignoreData = join(base, 'data-gitignore')
@@ -247,6 +297,40 @@ try {
   const legacyRestore = await legacyStore.restore(legacyEvents, { atSeq: 50 })
   assertTrue(legacyRestore.restored.includes('legacy.txt'), 'legacy blob restored successfully')
   assertEqual(await readFile(join(legacyWs, 'legacy.txt'), 'utf8'), 'legacy content\n', 'legacy content matches')
+
+  // ── resetBaseline：空白会话的陈旧基线必须能对齐到当前工作区 ─────────────
+  {
+    const resetWs = join(base, 'ws-reset')
+    const resetData = join(base, 'data-reset')
+    await mkdir(resetWs, { recursive: true })
+    await writeFile(join(resetWs, 'keep.txt'), 'base\n')
+    await writeFile(join(resetWs, 'stale.txt'), 'STALE\n')
+
+    // 模拟“此前创建的空白会话”：基线包含 stale.txt
+    const reused = new CheckpointStore(resetData, resetWs)
+    const staleBaseline = await reused.ensureBaseline()
+    assertTrue('stale.txt' in staleBaseline.files, '陈旧基线包含 stale.txt')
+
+    // 随后 stale.txt 被删除（例如上一次还原清掉了它）
+    await rm(join(resetWs, 'stale.txt'))
+
+    // 复用该会话时必须重建基线
+    const reset = await reused.resetBaseline()
+    assertTrue(reset === true, '空白会话允许重建基线')
+    const fresh = await reused.ensureBaseline()
+    assertTrue(!('stale.txt' in fresh.files), '重建后的基线不再包含已删除的 stale.txt')
+
+    // 重建后回退不应复活 stale.txt
+    await writeFile(join(resetWs, 'work.txt'), 'work\n')
+    await reused.recordTurn(1, 10)
+    await reused.restore([], { baseline: true })
+    assertTrue(await exists(join(resetWs, 'stale.txt')) === false, '回退不得复活已删除文件')
+    assertTrue(await exists(join(resetWs, 'work.txt')) === false, '回退应删除本轮产物')
+
+    // 已有轮次检查点的会话拒绝重建，保护历史基线
+    const refused = await reused.resetBaseline()
+    assertTrue(refused === false, '已有轮次检查点的会话应拒绝重建基线')
+  }
 
   console.log('checkpoints.test.mjs: all assertions passed ✓')
 } finally {

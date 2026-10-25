@@ -660,6 +660,61 @@ export class CheckpointStore {
   }
 
   /**
+   * 丢弃已有基线并按当前工作区重建（仅当该会话还没有任何轮次检查点时允许）。
+   *
+   * 使用场景：回退/编辑会先还原工作区，再让 Workspace 流程「复用」一个此前创建的空白会话。
+   * 那个空白会话的基线是它诞生时的旧状态，可能包含后来已被删除的文件——
+   * 若沿用它，用户在那个会话里再点回退时，插件会把已删除的文件「复活」出来。
+   * 因此复用空白会话时必须以还原后的真实工作区重建基线。
+   *
+   * 已有轮次检查点的会话拒绝重建：那意味着它已经工作过，其基线是有效的历史依据。
+   *
+   * @returns 是否执行了重建（已有轮次时返回 false）。
+   */
+  async resetBaseline(now = Date.now()): Promise<boolean> {
+    await this.loadTurns()
+    if (this.turns.size > 0) return false
+
+    await this.loadBaseline()
+    const old = this.baseline
+    // 清理旧基线遗留的 blob 之外，不删除共享 CAS（其他快照可能引用同一 sha，
+    // 且目录内 blob 以内容寻址，冗余不会造成正确性问题）。
+    const scanStartedAt = Date.now()
+    const files = await walkWorkspace(this.root, this.options)
+
+    let raced = false
+    for (const file of Object.values(files)) {
+      if (file.mtimeMs >= scanStartedAt) {
+        raced = true
+        break
+      }
+    }
+
+    const entries = Object.entries(files).filter(([, file]) => file.sha !== undefined)
+    await runPool(entries, this.options.ioConcurrency, async ([rel, file]) => {
+      await this.saveBlob(file.sha as string, join(this.root, rel), file.size)
+    })
+    const ignoredSnapshot = await walkIgnoredPaths(this.root, this.options)
+
+    const baseline: Checkpoint = {
+      kind: 'baseline',
+      turn: 0,
+      endSeq: -1,
+      at: now,
+      files,
+      ...(raced ? { raced: true } : {}),
+      ignored: ignoredSnapshot.entries,
+      ...(ignoredSnapshot.truncated ? { ignoredTruncated: true } : {}),
+    }
+    await writeAtomic(this.baselinePath(), JSON.stringify(baseline))
+    this.baseline = baseline
+    if (old !== undefined) {
+      this.options.logger.info?.(`[dsh-recover-context] 已按当前工作区重建基线（原基线 ${Object.keys(old.files).length} 项 → 现 ${Object.keys(files).length} 项）`)
+    }
+    return true
+  }
+
+  /**
    * 记录一轮完成时的检查点。
    * 采用差量快照：未变动的文件通过 mtime 复用哈希；本轮新增或修改的文件流式写入 CAS blobs/<sha>。
    */
@@ -699,8 +754,7 @@ export class CheckpointStore {
   }
 
   /** 获取指定轮次前最近的可用快照（前一轮或初始基线） */
-  private async previousOf(turn: number): Promise<Checkpoint | undefined> {
-    if (turn <= 1) {
+  private async previousOf(turn: number): Promise<Checkpoint | undefined> {    if (turn <= 1) {
       await this.loadBaseline()
       return this.baseline
     }

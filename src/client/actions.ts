@@ -124,6 +124,12 @@ function workspaceOf(ctx: ClientContext, sessionId: string): { workspaceId?: str
 
 /**
  * 通用的“截断到某个问题之前”操作。
+ *
+ * 顺序很重要：**先还原工作区，再创建/分叉子会话**。
+ * 子会话的基线是在它诞生时对工作区快照采集的；若先 fork 再还原，
+ * 基线会记录下仍然残留的、本轮产出的文件（例如被编辑轮次写出的 3.txt）。
+ * 之后在子会话里再点回退时，基线认为那些文件本来就在，插件反而会把它们重建出来。
+ *
  * @param boundarySeqOrNull 上一已完成轮次的 turn/end seq；null 表示首个问题
  * @param draftText 截断后载入新会话输入框的文本
  */
@@ -139,8 +145,7 @@ async function cutBefore(
   let restore: RestoreResult
 
   if (boundarySeqOrNull === null) {
-    // 第一个问题：先把工作区还原到初始基线，再通过 Workspace 流程解析空白会话，
-    // 使新会话的基线恰好是还原后的状态，且能被 UI 正常打开。
+    // 第一个问题：先还原到初始基线，再创建空白会话，使新会话基线即还原后状态。
     restore = await callApi<RestoreResult>('restore', { sessionId, baseline: true, dryRun: false })
     const target = workspaceOf(ctx, sessionId)
     if (target.workspaceId !== undefined && ctx.uiWorkspace.connectWorkspace !== undefined) {
@@ -148,9 +153,13 @@ async function cutBefore(
     } else {
       childId = await ctx.sessions.create(target)
     }
+    // connectWorkspace 可能复用此前创建的空白会话，其基线是旧状态
+    // （可能包含刚刚被还原删除的文件）。对齐到还原后的真实工作区。
+    await resetBaselineQuietly(childId)
   } else {
-    childId = await ctx.sessions.fork({ sessionId, atSeq: boundarySeqOrNull })
+    // 先还原到该边界，再分叉：子会话基线因此反映还原后的真实状态。
     restore = await callApi<RestoreResult>('restore', { sessionId, atSeq: boundarySeqOrNull, dryRun: false })
+    childId = await ctx.sessions.fork({ sessionId, atSeq: boundarySeqOrNull })
   }
 
   await archive(ctx, sessionId)
@@ -161,15 +170,18 @@ async function cutBefore(
   return { childId, restore }
 }
 
-/** 回滚到包含 atSeq 的轮次完成状态，恢复文件，归档旧会话，打开子会话 */
+/**
+ * 回滚到包含 atSeq 的轮次完成状态，恢复文件，归档旧会话，打开子会话。
+ * 与 {@link cutBefore} 同理：先还原工作区，再分叉，避免子会话基线记录残留文件。
+ */
 export async function rollback(
   ctx: ClientContext,
   sessionId: string,
   atSeq: number,
 ): Promise<RecoverOperationResult> {
   await cancelIfRunning(ctx, sessionId)
-  const childId = await ctx.sessions.fork({ sessionId, atSeq })
   const restore = await callApi<RestoreResult>('restore', { sessionId, atSeq, dryRun: false })
+  const childId = await ctx.sessions.fork({ sessionId, atSeq })
   await archive(ctx, sessionId)
   ctx.uiWorkspace.openSession(childId)
   return { childId, restore }
@@ -189,6 +201,18 @@ export async function rollbackBefore(
 /** 预检恢复文件数量（dryRun 试运行） */
 export function previewRestore(sessionId: string, atSeq: number): Promise<RestoreResult> {
   return callApi<RestoreResult>('restore', { sessionId, atSeq, dryRun: true })
+}
+
+/**
+ * 尽力把某个空白会话的基线对齐到当前工作区。
+ * 失败不应阻断回退流程：新会话仍可用，只是历史基线可能略陈旧。
+ */
+async function resetBaselineQuietly(sessionId: string): Promise<void> {
+  try {
+    await callApi<{ reset: boolean }>('resetBaseline', { sessionId })
+  } catch {
+    // 宿主未提供该接口或会话已有轮次时忽略
+  }
 }
 
 /**

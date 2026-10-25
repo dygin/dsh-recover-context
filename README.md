@@ -1,6 +1,6 @@
 # dsh-recover-context
 
-> v1.0.8 · 适配 DeepSeek Harness 0.2.1+
+> v1.0.9 · 适配 DeepSeek Harness 0.2.1+
 
 恢复上下文插件。
 

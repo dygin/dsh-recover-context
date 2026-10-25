@@ -254,6 +254,24 @@ export function apply(ctx: RecoverContext): void {
     },
 
     /**
+     * 按当前工作区重建该会话的基线（仅对尚无任何轮次检查点的空白会话生效）。
+     *
+     * 回滚/编辑会先还原工作区、再让 Workspace 流程复用或创建空白会话；
+     * 被复用的空白会话可能带着陈旧基线。调用本方法让它对齐还原后的真实状态，
+     * 避免日后在该会话里回退时把已删除的文件“复活”。
+     */
+    async resetBaseline(payload: unknown): Promise<unknown> {
+      const sessionId = requireString(payload, 'sessionId')
+      const store = await storeFor(sessionId)
+      if (store === undefined) {
+        throw new RecoverError('not-found', `未找到会话 "${sessionId}" 的恢复上下文记录`, 404)
+      }
+      const result = await enqueue(sessionId, async () => store.resetBaseline())
+      if (result === undefined) throw new RecoverError('internal', '基线重建失败')
+      return { reset: result }
+    },
+
+    /**
      * 将工作区目录还原到回滚点。
      * atSeq 指定截断锚点；baseline: true 恢复到初始状态；dryRun 仅做预检。
      */
@@ -275,7 +293,7 @@ export function apply(ctx: RecoverContext): void {
 
   /** 按方法名分发一次 API 调用 */
   async function dispatch(method: string, payload: unknown): Promise<unknown> {
-    if (method !== 'checkpoints' && method !== 'restore') {
+    if (method !== 'checkpoints' && method !== 'restore' && method !== 'resetBaseline') {
       throw new RecoverError('not-found', `未知的 recover-context API 方法 "${method}"`, 404)
     }
     return api[method](payload)
@@ -286,6 +304,7 @@ export function apply(ctx: RecoverContext): void {
   const routes = [
     { method: 'checkpoints', path: '/api/recover-context/checkpoints' },
     { method: 'restore', path: '/api/recover-context/restore' },
+    { method: 'resetBaseline', path: '/api/recover-context/resetBaseline' },
   ] as const
 
   if (connection !== undefined) {
