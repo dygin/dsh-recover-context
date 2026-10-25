@@ -175,11 +175,17 @@ export function apply(ctx: RecoverContext): void {
     }
   }
 
-  /** 获取或初始化会话的检查点存储器 */
-  async function storeFor(sessionId: string): Promise<CheckpointStore | undefined> {
+  /**
+   * 获取或初始化会话的检查点存储器。
+   * @param fallbackRoot - 无法从会话自身解析 cwd 时使用（fork 刚完成时子会话可能尚不可查）。
+   */
+  async function storeFor(
+    sessionId: string,
+    fallbackRoot?: string,
+  ): Promise<CheckpointStore | undefined> {
     const existing = stores.get(sessionId)
     if (existing !== undefined) return existing
-    const root = await workspaceRootOf(sessionId)
+    const root = (await workspaceRootOf(sessionId)) ?? fallbackRoot
     if (root === undefined) return undefined
     const dshRoot = dshHome()
     if (root === dshRoot || root.startsWith(dshRoot + sep)) return undefined // 绝不追踪 DSH 自身主目录
@@ -306,6 +312,31 @@ export function apply(ctx: RecoverContext): void {
     },
 
     /**
+     * fork 后让子会话继承父会话的检查点历史。
+     *
+     * 子会话的自动基线是 fork 时刻的状态，已包含被继承轮次的产物；若沿用它，
+     * 在子会话里编辑/回退被继承的问题时撤不掉那些产物。继承父会话的基线 +
+     * 截止 `upToSeq` 的各轮快照后，子会话的回退语义与父会话一致。
+     */
+    async inheritCheckpoints(payload: unknown): Promise<unknown> {
+      const sessionId = requireString(payload, 'sessionId')
+      const parentSessionId = requireString(payload, 'parentSessionId')
+      const upToSeq = optionalNumber(payload, 'upToSeq')
+      if (parentSessionId === sessionId) {
+        throw new RecoverError('bad-request', '父会话与子会话不能相同')
+      }
+      const parentRoot = await workspaceRootOf(parentSessionId)
+      const child = await storeFor(sessionId, parentRoot)
+      if (child === undefined) {
+        throw new RecoverError('not-found', `未找到会话 "${sessionId}" 的恢复上下文记录`, 404)
+      }
+      const parentDir = join(storageRoot(), parentSessionId)
+      const result = await enqueue(sessionId, async () => child.inheritFrom(parentDir, upToSeq))
+      if (result === undefined) throw new RecoverError('internal', '检查点继承失败')
+      return result
+    },
+
+    /**
      * 按当前工作区重建该会话的基线（仅对尚无任何轮次检查点的空白会话生效）。
      *
      * 回滚/编辑会先还原工作区、再让 Workspace 流程复用或创建空白会话；
@@ -355,7 +386,12 @@ export function apply(ctx: RecoverContext): void {
 
   /** 按方法名分发一次 API 调用 */
   async function dispatch(method: string, payload: unknown): Promise<unknown> {
-    if (method !== 'checkpoints' && method !== 'restore' && method !== 'resetBaseline') {
+    if (
+      method !== 'checkpoints'
+      && method !== 'restore'
+      && method !== 'resetBaseline'
+      && method !== 'inheritCheckpoints'
+    ) {
       throw new RecoverError('not-found', `未知的 recover-context API 方法 "${method}"`, 404)
     }
     return api[method](payload)
@@ -367,6 +403,7 @@ export function apply(ctx: RecoverContext): void {
     { method: 'checkpoints', path: '/api/recover-context/checkpoints' },
     { method: 'restore', path: '/api/recover-context/restore' },
     { method: 'resetBaseline', path: '/api/recover-context/resetBaseline' },
+    { method: 'inheritCheckpoints', path: '/api/recover-context/inheritCheckpoints' },
   ] as const
 
   if (connection !== undefined) {

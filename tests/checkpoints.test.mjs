@@ -374,6 +374,80 @@ try {
     assertTrue(await exists(join(lateWs, '1.txt')) === true, '晚采集基线中原有产物不会被删除')
   }
 
+  // ── fork 子会话必须继承父会话的检查点历史 ────────────────────────────────
+  // 用户场景：第 1 问把当天天气写入 1.txt，第 2 问把明日天气写入 1.txt；
+  // 回退第 2 问（1.txt 恢复成"当天"）后，在子会话里编辑第 1 问，
+  // 期望 1.txt 被删除（因为第 1 问之前它根本不存在）。
+  {
+    const chainWs = join(base, 'ws-chain')
+    const parentData = join(base, 'data-chain-parent')
+    const childData = join(base, 'data-chain-child')
+    await mkdir(chainWs, { recursive: true })
+    await writeFile(join(chainWs, 'keep.txt'), 'base\n')
+
+    const parent = new CheckpointStore(parentData, chainWs)
+    await parent.ensureBaseline()
+    await writeFile(join(chainWs, '1.txt'), 'today\n')     // 第 1 问
+    await parent.recordTurn(1, 28)
+    await writeFile(join(chainWs, '1.txt'), 'tomorrow\n')  // 第 2 问
+    await parent.recordTurn(2, 44)
+
+    const parentEvents = [
+      { type: 'turn/end', seq: 28, data: { turn: 1 } },
+      { type: 'turn/end', seq: 44, data: { turn: 2 } },
+    ]
+
+    // 回退第 2 问：回到第 1 轮结束态，1.txt = today
+    await parent.restore(parentEvents, { atSeq: 28 })
+    assertEqual(await readFile(join(chainWs, '1.txt'), 'utf8'), 'today\n', '回退第 2 问后 1.txt 为当天天气')
+
+    // fork 子会话，并让子会话继承父会话历史（截止第 1 轮结束）
+    const child = new CheckpointStore(childData, chainWs)
+    const inherited = await child.inheritFrom(parentData, 28)
+    assertTrue(inherited.baseline === true, '子会话应继承父会话基线')
+    assertTrue(inherited.turns.join(',') === '1', '子会话应继承第 1 轮快照')
+
+    // 子会话的基线必须是"工作开始前"（不含 1.txt），而不是 fork 时刻的旧基线
+    const childBaseline = await child.ensureBaseline()
+    assertTrue(!('1.txt' in childBaseline.files), '继承后的基线不含 1.txt')
+
+    // 在子会话里编辑第 1 问 → 按基线还原 → 1.txt 必须被删除
+    const editRestore = await child.restore([], { baseline: true })
+    assertTrue(editRestore.deleted.includes('1.txt'), '编辑第 1 问应删除 1.txt')
+    assertTrue(await exists(join(chainWs, '1.txt')) === false, '1.txt 已从磁盘删除')
+    assertEqual(await readFile(join(chainWs, 'keep.txt'), 'utf8'), 'base\n', '无关文件保持完好')
+  }
+
+  // ── 继承后的子会话继续工作，回退仍应正确 ────────────────────────────────
+  {
+    const chainWs = join(base, 'ws-chain2')
+    const parentData = join(base, 'data-chain2-parent')
+    const childData = join(base, 'data-chain2-child')
+    await mkdir(chainWs, { recursive: true })
+    await writeFile(join(chainWs, 'keep.txt'), 'base\n')
+    const parent = new CheckpointStore(parentData, chainWs)
+    await parent.ensureBaseline()
+    await writeFile(join(chainWs, 'a.txt'), 'a\n')
+    await parent.recordTurn(1, 20)
+    await parent.recordTurn(2, 30)
+
+    const child = new CheckpointStore(childData, chainWs)
+    await child.inheritFrom(parentData, 20)
+    // 子会话自己的第 3 轮
+    await writeFile(join(chainWs, 'b.txt'), 'b\n')
+    await child.recordTurn(3, 40)
+    const childEvents = [
+      { type: 'turn/end', seq: 20, data: { turn: 1 } },
+      { type: 'turn/end', seq: 30, data: { turn: 2 } },
+      { type: 'turn/end', seq: 40, data: { turn: 3 } },
+    ]
+    // 回退到第 2 问之前（boundary = 第 1 轮结束）
+    const r = await child.restore(childEvents, { atSeq: 25 })
+    assertEqual(r.boundary?.turn, 2, '边界应解析为第 2 轮')
+    assertTrue(r.deleted.includes('b.txt'), '子会话自身产物 b.txt 应被删除')
+    assertTrue(await exists(join(chainWs, 'a.txt')) === true, '被继承轮次的 a.txt 应保留')
+  }
+
   console.log('checkpoints.test.mjs: all assertions passed ✓')
 } finally {
   await rm(base, { recursive: true, force: true })

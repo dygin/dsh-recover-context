@@ -521,6 +521,125 @@ export class CheckpointStore {
     return this.root
   }
 
+  /** 本会话快照数据的存放目录（供 fork 后继承父会话历史使用）。 */
+  get storageDir(): string {
+    return this.dir
+  }
+
+  /** 清空内存缓存，使下次读取重新从磁盘加载（继承/重建后使用）。 */
+  private resetCache(): void {
+    this.baselineLoaded = false
+    this.baseline = undefined
+    this.turnsLoaded = false
+    this.turns.clear()
+    this.totalBlobBytes = 0
+  }
+
+  /** 重新统计已占用的 blob 字节数（继承父会话 blob 后使用）。 */
+  private async recountBlobBytes(): Promise<void> {
+    let total = 0
+    try {
+      for (const name of await readdir(this.blobsDir())) {
+        try {
+          total += (await stat(join(this.blobsDir(), name))).size
+        } catch {
+          // 统计失败的条目忽略
+        }
+      }
+    } catch {
+      total = 0
+    }
+    this.totalBlobBytes = total
+  }
+
+  /**
+   * 从父会话的存储目录继承检查点历史。
+   *
+   * fork 出的子会话会继承父会话的若干轮对话，但它的工作区基线是 fork 那一刻的状态——
+   * 也就是**已经包含那些被继承轮次产物**的状态。若沿用它，在子会话里编辑/回退被继承的
+   * 问题时就撤不掉那些产物（插件认为它们"原本就存在"）。
+   *
+   * 因此子会话必须继承父会话的完整历史：基线（真正的"工作开始前"）+ 截止 fork 边界的
+   * 各轮快照 + 它们引用的 blob。继承后，子会话里的回退/编辑行为与父会话完全一致。
+   *
+   * @param parentDir - 父会话的存储目录。
+   * @param upToEndSeq - 只继承 endSeq ≤ 该值的轮次（即 fork 边界及之前）。
+   */
+  async inheritFrom(
+    parentDir: string,
+    upToEndSeq?: number,
+  ): Promise<{ baseline: boolean; turns: number[] }> {
+    if (resolve(parentDir) === resolve(this.dir)) return { baseline: false, turns: [] }
+
+    const load = async (file: string): Promise<Checkpoint | undefined> => {
+      try {
+        return JSON.parse(await readFile(join(parentDir, file), 'utf8')) as Checkpoint
+      } catch {
+        return undefined
+      }
+    }
+
+    const parentBaseline = await load('baseline.json')
+    const parentTurns: Checkpoint[] = []
+    let names: string[] = []
+    try {
+      names = await readdir(parentDir)
+    } catch {
+      names = []
+    }
+    for (const name of names) {
+      if (!/^turn-\d+\.json$/.test(name)) continue
+      const checkpoint = await load(name)
+      if (checkpoint === undefined) continue
+      if (upToEndSeq !== undefined && checkpoint.endSeq > upToEndSeq) continue
+      parentTurns.push(checkpoint)
+    }
+    parentTurns.sort((left, right) => left.turn - right.turn)
+
+    if (parentBaseline === undefined && parentTurns.length === 0) {
+      return { baseline: false, turns: [] }
+    }
+
+    await mkdir(this.dir, { recursive: true })
+    if (parentBaseline !== undefined) {
+      await writeAtomic(this.baselinePath(), JSON.stringify(parentBaseline))
+    }
+    for (const checkpoint of parentTurns) {
+      await writeAtomic(this.turnPath(checkpoint.turn), JSON.stringify(checkpoint))
+    }
+
+    // 只复制被继承快照引用的 blob
+    const shas = new Set<string>()
+    for (const checkpoint of [parentBaseline, ...parentTurns]) {
+      if (checkpoint === undefined) continue
+      for (const file of Object.values(checkpoint.files)) {
+        if (file.sha !== undefined) shas.add(file.sha)
+      }
+    }
+    if (shas.size > 0) await mkdir(this.blobsDir(), { recursive: true })
+    for (const sha of shas) {
+      if (await this.hasBlob(sha)) continue
+      const tmp = `${this.blobPath(sha)}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+      try {
+        await pipeline(
+          createReadStream(join(parentDir, 'blobs', sha)),
+          createWriteStream(tmp),
+        )
+        await rename(tmp, this.blobPath(sha))
+      } catch {
+        await rm(tmp, { force: true }).catch(() => undefined)
+        // 缺失的 blob 会让对应文件在回退时报告 no-content，不影响其余还原
+      }
+    }
+
+    this.resetCache()
+    await this.recountBlobBytes()
+    return {
+      baseline: parentBaseline !== undefined,
+      turns: parentTurns.map(checkpoint => checkpoint.turn),
+    }
+  }
+
   private baselinePath(): string {
     return join(this.dir, 'baseline.json')
   }

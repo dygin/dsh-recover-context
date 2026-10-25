@@ -175,6 +175,10 @@ function withRestoreStub<T>(
       calls.push(`resetBaseline:${String(body.sessionId)}`)
       return { json: async () => ({ ok: true, value: { reset: true } }) } as Response
     }
+    if (method === 'inheritCheckpoints') {
+      calls.push(`inherit:${String(body.sessionId)}<-${String(body.parentSessionId)}@${String(body.upToSeq)}`)
+      return { json: async () => ({ ok: true, value: { baseline: true, turns: [] } }) } as Response
+    }
     calls.push(`restore:${body.baseline === true ? 'baseline' : `atSeq=${String(body.atSeq)}`}`)
     return { json: async () => okRestore(mode) } as Response
   }) as typeof fetch
@@ -189,7 +193,7 @@ function withRestoreStub<T>(
   assert.equal(result.childId, 'child-1')
   assert.deepEqual(
     ctx.calls,
-    ['restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1'],
+    ['restore:atSeq=10', 'fork:10', 'inherit:child-1<-s1@10', 'archive:s1', 'open:child-1'],
     '回退必须先还原工作区，再分叉子会话',
   )
   assert.equal(result.restore.mode, 'turn')
@@ -214,7 +218,7 @@ function withRestoreStub<T>(
   await withRestoreStub(ctx.calls, 'turn', () => rollback(ctx, 's1', 10))
   assert.deepEqual(
     ctx.calls,
-    ['cancel', 'restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1'],
+    ['cancel', 'restore:atSeq=10', 'fork:10', 'inherit:child-1<-s1@10', 'archive:s1', 'open:child-1'],
     '运行中回退必须先取消并等待停止，再还原',
   )
 }
@@ -276,7 +280,7 @@ function withRestoreStub<T>(
   })
   assert.deepEqual(
     ctx.calls,
-    ['draft:edited question', 'restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1', 'prompt:[{"type":"text","text":"edited question"}]:queue'],
+    ['draft:edited question', 'restore:atSeq=10', 'fork:10', 'inherit:child-1<-s1@10', 'archive:s1', 'open:child-1', 'prompt:[{"type":"text","text":"edited question"}]:queue'],
     '提交时必须先还原工作区再分叉，否则子会话基线会记录本轮残留文件',
   )
 }

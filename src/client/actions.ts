@@ -188,6 +188,9 @@ async function cutBefore(
   } else {
     // 还原已让工作区对齐边界状态，分叉出的子会话基线因此正确。
     childId = await ctx.sessions.fork({ sessionId, atSeq: boundarySeqOrNull })
+    // 子会话继承了父会话的若干轮对话，但它的自动基线是 fork 时刻（已含那些轮次的产物）。
+    // 继承父会话的检查点历史后，在子会话里编辑/回退被继承的问题才能撤掉它们的产物。
+    await inheritCheckpointsQuietly(childId, sessionId, boundarySeqOrNull)
   }
 
   await archive(ctx, sessionId)
@@ -213,6 +216,8 @@ export async function rollback(
   }
   const restore = await callApi<RestoreResult>('restore', { sessionId, atSeq, dryRun: false })
   const childId = await ctx.sessions.fork({ sessionId, atSeq })
+  // 子会话需继承父会话历史，否则在其中再次回退时撤不掉被继承轮次的产物
+  await inheritCheckpointsQuietly(childId, sessionId, atSeq)
   await archive(ctx, sessionId)
   ctx.uiWorkspace.openSession(childId)
   return { childId, restore }
@@ -243,6 +248,26 @@ async function resetBaselineQuietly(sessionId: string): Promise<void> {
     await callApi<{ reset: boolean }>('resetBaseline', { sessionId })
   } catch {
     // 宿主未提供该接口或会话已有轮次时忽略
+  }
+}
+
+/**
+ * 让 fork 出的子会话继承父会话的检查点历史（截止 fork 边界）。
+ * 失败不应阻断流程：最坏情况是子会话里回退被继承轮次时无法撤销其产物。
+ */
+async function inheritCheckpointsQuietly(
+  childId: string,
+  parentSessionId: string,
+  upToSeq: number,
+): Promise<void> {
+  try {
+    await callApi<{ baseline: boolean; turns: number[] }>('inheritCheckpoints', {
+      sessionId: childId,
+      parentSessionId,
+      upToSeq,
+    })
+  } catch {
+    // 忽略：子会话仍可工作，只是历史还原能力受限
   }
 }
 
