@@ -1,6 +1,6 @@
 # dsh-recover-context
 
-> v1.0.7 · 适配 DeepSeek Harness 0.2.1+
+> v1.0.8 · 适配 DeepSeek Harness 0.2.1+
 
 恢复上下文插件。
 
@@ -32,7 +32,10 @@ blobs/<sha>        按内容寻址（CAS）存储的文件内容
 - **内容按哈希去重**：文件内容按 SHA-256 存成独立 blob，跨轮次、跨同名文件自动复用；恢复时按索引取回。
 - **流式哈希与原子落盘**：SHA-256 用流式计算；所有 JSON 与 blob 先写临时文件再 `rename`，进程中断不会留下半成品。
 - **自动读取 `.gitignore`**：遍历时解析工作区根目录的 `.gitignore`（支持通配符、目录规则、`!` 取反），大型数据目录不会被扫描。
-- **安全上限**：`maxFiles`（默认 100,000）与 `maxTotalBlobBytes`（默认 500MB）防止超大仓库失控。
+- **被忽略路径也会被回退**：被忽略路径不备份内容，但会记录其存在性索引。回退时只删除「本会话新增」的
+  产物（如 `dist/`、`build/`、`*.log`），会话开始前就存在的同类文件保持不动。
+- **安全上限**：`maxFiles`（默认 100,000）与 `maxTotalBlobBytes`（默认 512 MiB）防止超大仓库失控。
+  单文件默认不限体积（流式复制，内存恒定），可用 `blobSizeCap` 显式收紧。
 
 ## 配置
 
@@ -44,10 +47,10 @@ blobs/<sha>        按内容寻址（CAS）存储的文件内容
   "enableGitignore": true,
   "ignoreNames": [".git", "node_modules", ".pnpm-store", "dist", "build", ".venv", "__pycache__", ".DS_Store"],
   "ignorePatterns": ["*.pyc", "*.log", "*.tmp"],
-  "trackSizeCap": 5242880,
-  "blobSizeCap": 1048576,
+  "trackSizeCap": 104857600,
   "maxFiles": 100000,
-  "maxTotalBlobBytes": 524288000
+  "maxTotalBlobBytes": 536870912,
+  "ioConcurrency": 8
 }
 ```
 
@@ -57,10 +60,11 @@ blobs/<sha>        按内容寻址（CAS）存储的文件内容
 | `enableGitignore` | 是否解析工作区 `.gitignore` |
 | `ignoreNames` | 按名字忽略的目录/文件 |
 | `ignorePatterns` | 按文件名通配符忽略 |
-| `trackSizeCap` | 超过该大小的文件只记录 size+mtime，不计算哈希 |
-| `blobSizeCap` | 超过该大小的文件不备份内容（回退时会跳过并提示） |
+| `trackSizeCap` | 超过该大小的文件只记录 size+mtime，不计算哈希、不备份内容（默认 100 MiB） |
+| `blobSizeCap` | 可选：单文件内容备份上限，默认不限制（受 `maxTotalBlobBytes` 兜底） |
 | `maxFiles` | 扫描文件数上限，超出即停止并告警 |
-| `maxTotalBlobBytes` | 单次回退所需 blob 总量上限 |
+| `maxTotalBlobBytes` | 单个会话可备份的 blob 总字节上限 |
+| `ioConcurrency` | 哈希计算与 blob 写入的并发度 |
 
 ## License
 

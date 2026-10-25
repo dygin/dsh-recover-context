@@ -85,6 +85,7 @@ function QuestionActionsInner(props: QuestionActionsProps & { ctx: ClientContext
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   useEffect(() => {
@@ -105,8 +106,23 @@ function QuestionActionsInner(props: QuestionActionsProps & { ctx: ClientContext
     setConfirming(false)
     setBusy(true)
     setError('')
+    setNotice('')
     try {
-      await rollbackBefore(ctx, sessionId, info.boundarySeq)
+      const result = await rollbackBefore(ctx, sessionId, info.boundarySeq)
+      // 回退成功后组件通常随即卸载（导航到新会话）；若仍在原会话上，
+      // 用一行摘要说明恢复了什么、删掉了什么，避免「看起来没生效」。
+      const restore = result.restore
+      if (restore.mode === 'none') {
+        setNotice(t('rollbackNone'))
+      } else {
+        const skipped = restore.skipped.length > 0 ? t('rollbackSkipped', { skipped: restore.skipped.length }) : ''
+        const warned = (restore.warnings ?? []).length > 0 ? t('rollbackWarned', { warning: (restore.warnings ?? [])[0] }) : ''
+        setNotice(`${t('rollbackResult', {
+          restored: restore.restored.length,
+          deleted: restore.deleted.length,
+        })}${skipped}${warned}`)
+      }
+      setBusy(false)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
       setBusy(false)
@@ -119,6 +135,8 @@ function QuestionActionsInner(props: QuestionActionsProps & { ctx: ClientContext
     setError('')
     try {
       await beginEdit(ctx, sessionId, info.userText, info.boundarySeq)
+      // 载入草稿后必须给出可见反馈，否则用户会以为点击无效。
+      setNotice(t('editDraftReady'))
       setBusy(false)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
@@ -147,12 +165,31 @@ function QuestionActionsInner(props: QuestionActionsProps & { ctx: ClientContext
     opacity: 1,
   }
 
+  const message = error !== ''
+    ? `${t('errorPrefix')}${error}`
+    : notice !== '' ? notice : undefined
+  const hasMessage = message !== undefined
+
   return (
     <div
-      style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 2, margin: '1px 0', height: 22 }}
+      style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 4, margin: '1px 0', minHeight: 22 }}
       data-recover-question-actions={`t${info.turn}`}
-      title={error !== '' ? `${t('errorPrefix')}${error}` : undefined}
+      title={message}
     >
+      {hasMessage && (
+        <span
+          data-recover-status={error !== '' ? 'error' : 'notice'}
+          style={{
+            fontSize: 11,
+            lineHeight: 1.4,
+            opacity: 0.75,
+            color: error !== '' ? '#d9534f' : 'inherit',
+            maxWidth: 420,
+          }}
+        >
+          {message}
+        </span>
+      )}
       <button
         type="button"
         className="rc-icon-btn"

@@ -172,6 +172,10 @@ console.log('q2 markup:', JSON.stringify(html2))
 const svgCount2 = (html2.match(/<svg/g) ?? []).length
 if (svgCount2 !== 2) throw new Error(`最后一个问题应有两个图标（回退 + 编辑），实际 ${svgCount2}`)
 
+// 初始渲染不得出现结果/错误文案（未操作前保持安静）
+if (html1.includes('data-recover-status')) throw new Error('初始状态不应渲染状态文案')
+if (html2.includes('data-recover-status')) throw new Error('初始状态不应渲染状态文案')
+
 // 缺少 useChat 时安全降级为 null（不抛渲染错误）
 const missing = renderToStaticMarkup(createElement(Comp, {
   node: qNode1, sessionId: 's1', t,

@@ -11,6 +11,8 @@ export interface RestoreResult {
   restored: string[]
   deleted: string[]
   skipped: { path: string; reason: string }[]
+  /** 影响还原完整性的提示（例如基线在采集期间已被本轮改动污染） */
+  warnings?: string[]
   dryRun: boolean
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-recover-context",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "DSH web plugin: roll back to before any of your questions, or edit the last one and resubmit, restoring the workspace files the discarded turns produced.",
   "author": "dsh_recover_context",
   "repository": {

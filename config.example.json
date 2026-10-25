@@ -3,8 +3,8 @@
   "enableGitignore": true,
   "ignoreNames": [".git", "node_modules", ".pnpm-store", "dist", "build", ".venv", "__pycache__", ".DS_Store"],
   "ignorePatterns": ["*.pyc", "*.log", "*.tmp"],
-  "trackSizeCap": 5242880,
-  "blobSizeCap": 1048576,
+  "trackSizeCap": 104857600,
   "maxFiles": 100000,
-  "maxTotalBlobBytes": 524288000
+  "maxTotalBlobBytes": 536870912,
+  "ioConcurrency": 8
 }

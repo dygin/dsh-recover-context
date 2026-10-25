@@ -126,6 +126,93 @@ try {
   assertTrue(!('stuff/big.bin' in gitignoreBaseline.files), 'stuff/ directory is ignored via .gitignore')
   assertTrue(!('file.secret' in gitignoreBaseline.files), '*.secret is ignored via .gitignore')
 
+  // ── 被忽略路径的产物必须被撤销，但会话前已有的文件必须保留 ──────────────
+  const ignoredWs = join(base, 'ws-ignored')
+  const ignoredData = join(base, 'data-ignored')
+  await mkdir(ignoredWs, { recursive: true })
+  await writeFile(join(ignoredWs, '.gitignore'), 'dist/\n*.log\n')
+  await writeFile(join(ignoredWs, 'app.js'), 'v1\n')
+  // 会话开始前就存在的被忽略文件
+  await writeFile(join(ignoredWs, 'debug.log'), 'PRE-EXISTING')
+  await mkdir(join(ignoredWs, 'dist'), { recursive: true })
+  await writeFile(join(ignoredWs, 'dist', 'old.js'), 'OLD BUILD')
+
+  const ignoredStore = new CheckpointStore(ignoredData, ignoredWs)
+  await ignoredStore.ensureBaseline()
+  // 本轮 agent 写入的产物（全部落在被忽略路径）
+  await writeFile(join(ignoredWs, 'app.js'), 'v2\n')
+  await writeFile(join(ignoredWs, 'new.log'), 'NEW LOG')
+  await writeFile(join(ignoredWs, 'dist', 'bundle.js'), 'NEW BUILD')
+  await ignoredStore.recordTurn(1, 100)
+
+  const ignoredDry = await ignoredStore.restore([], { baseline: true, dryRun: true })
+  assertTrue(ignoredDry.deleted.includes('new.log'), 'dry-run 应报告新增日志将被删除')
+  assertTrue(ignoredDry.deleted.includes('dist/bundle.js'), 'dry-run 应报告新增构建产物将被删除')
+  assertTrue(!ignoredDry.deleted.includes('debug.log'), 'dry-run 不得把会话前的日志列入删除')
+  assertTrue(!ignoredDry.deleted.includes('dist/old.js'), 'dry-run 不得把会话前的构建产物列入删除')
+
+  await ignoredStore.restore([], { baseline: true })
+  assertEqual(await readFile(join(ignoredWs, 'app.js'), 'utf8'), 'v1\n', '被追踪文件已还原')
+  assertEqual(await readFile(join(ignoredWs, 'debug.log'), 'utf8'), 'PRE-EXISTING', '会话前的日志保留')
+  assertEqual(await readFile(join(ignoredWs, 'dist', 'old.js'), 'utf8'), 'OLD BUILD', '会话前的构建产物保留')
+  assertTrue(await exists(join(ignoredWs, 'new.log')) === false, '本轮新增日志已删除')
+  assertTrue(await exists(join(ignoredWs, 'dist', 'bundle.js')) === false, '本轮新增构建产物已删除')
+
+  // ── 本轮新建的空目录骨架也应被清理 ──────────────────────────────────────
+  {
+    const pruneWs = join(base, 'ws-prune')
+    const pruneData = join(base, 'data-prune')
+    await mkdir(pruneWs, { recursive: true })
+    await writeFile(join(pruneWs, 'app.js'), 'v1\n')
+    const pruneStore = new CheckpointStore(pruneData, pruneWs)
+    await pruneStore.ensureBaseline()
+    await mkdir(join(pruneWs, 'build', 'deep'), { recursive: true })
+    await writeFile(join(pruneWs, 'build', 'deep', 'out.js'), 'X')
+    await pruneStore.recordTurn(1, 100)
+    await pruneStore.restore([], { baseline: true })
+    assertTrue(await exists(join(pruneWs, 'build')) === false, '本轮新建的空目录应被清理')
+    assertEqual(await readFile(join(pruneWs, 'app.js'), 'utf8'), 'v1\n', '工作区文件保持完好')
+  }
+
+  // ── 大文件（超过旧版 1 MiB 上限）必须能还原 ─────────────────────────────
+  const bigWs = join(base, 'ws-big')
+  const bigData = join(base, 'data-big')
+  await mkdir(bigWs, { recursive: true })
+  const bigV1 = Buffer.alloc(3 * 1024 * 1024, 'a')
+  await writeFile(join(bigWs, 'bundle.bin'), bigV1)
+  const bigStore = new CheckpointStore(bigData, bigWs)
+  await bigStore.ensureBaseline()
+  await writeFile(join(bigWs, 'bundle.bin'), Buffer.alloc(3 * 1024 * 1024, 'b'))
+  await bigStore.recordTurn(1, 100)
+  const bigRestore = await bigStore.restore([], { baseline: true })
+  assertTrue(bigRestore.restored.includes('bundle.bin'), '超过 1 MiB 的文件也应被还原')
+  assertEqual(bigRestore.skipped.length, 0, '大文件还原不应有跳过项')
+  const bigAfter = await readFile(join(bigWs, 'bundle.bin'))
+  assertTrue(bigAfter.equals(bigV1), '大文件内容已精确还原')
+
+  // ── dry-run 与实际执行必须报告同一批文件 ────────────────────────────────
+  const consistencyWs = join(base, 'ws-consistency')
+  const consistencyData = join(base, 'data-consistency')
+  await mkdir(consistencyWs, { recursive: true })
+  await writeFile(join(consistencyWs, 'keep.txt'), 'same\n')
+  const consistencyStore = new CheckpointStore(consistencyData, consistencyWs)
+  await consistencyStore.ensureBaseline()
+  await writeFile(join(consistencyWs, 'keep.txt'), 'changed\n')
+  await writeFile(join(consistencyWs, 'added.txt'), 'added\n')
+  await consistencyStore.recordTurn(1, 100)
+  const preview = await consistencyStore.restore([], { baseline: true, dryRun: true })
+  const applied = await consistencyStore.restore([], { baseline: true })
+  assertEqual(
+    [...preview.restored].sort().join(','),
+    [...applied.restored].sort().join(','),
+    'dry-run 与真实还原的 restored 列表必须一致',
+  )
+  assertEqual(
+    [...preview.deleted].sort().join(','),
+    [...applied.deleted].sort().join(','),
+    'dry-run 与真实还原的 deleted 列表必须一致',
+  )
+
   // ── CAS deduplication & backward compatibility test ──────────────────────
   const legacyData = join(base, 'data-legacy')
   await mkdir(legacyData, { recursive: true })

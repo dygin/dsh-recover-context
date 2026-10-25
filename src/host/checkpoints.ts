@@ -15,8 +15,8 @@
  * 该引擎为无 cordis 依赖的独立纯 TypeScript 类，可通过 tests/checkpoints.test.mjs 独立测试。
  */
 import { createHash } from 'node:crypto'
-import { createReadStream } from 'node:fs'
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { mkdir, readFile, readdir, rename, rmdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 
@@ -26,6 +26,18 @@ export const DEFAULT_IGNORE_NAMES = [
   '.next', '.nuxt', '.idea', '.vscode', '.mypy_cache', '.pytest_cache',
   '.DS_Store', 'coverage', '.turbo', '.cache', 'target',
 ]
+/**
+ * 回退时额外清理「被忽略路径」时，永不进入的目录。
+ * 这些是依赖商店与版本控制元数据：既不是 agent 的交付物，遍历成本也极高。
+ * `dist`/`build`/`coverage` 等构建产物目录不在此列——它们正是需要被撤销的对象。
+ */
+export const NEVER_SCAN_IGNORED_DIRS = [
+  '.git', 'node_modules', '.pnpm-store', '.venv', 'venv', '__pycache__', '.cache', '.turbo',
+]
+
+/** 默认追踪的文件体积上限：超过则只记 size+mtime（不计算哈希、不备份内容） */
+export const DEFAULT_TRACK_SIZE_CAP = 100 * 1024 * 1024
+
 /** 默认永不追踪的文件名通配规则 */
 export const DEFAULT_IGNORE_PATTERNS = ['*.pyc', '*.pyo', '*.log', '*.tmp', '*.swp']
 
@@ -54,6 +66,19 @@ export interface Checkpoint {
    * 现代版本快照内容直接存储在 <storageDir>/blobs/<sha> 内容寻址池中。
    */
   blobs?: Record<string, string>
+  /**
+   * 基线是否在采集过程中与该轮的实际工作重叠（工作区很大时扫描可能慢于
+   * 第一次工具调用，导致基线里已包含该轮产物）。为 true 时回退到基线会给出提示。
+   */
+  raced?: boolean
+  /**
+   * 被忽略路径（`.gitignore` / ignoreNames / ignorePatterns）的存在性索引，仅记录 size+mtime。
+   * 不备份内容——这些路径通常是构建产物、日志与依赖，体量可能极大。
+   * 回退时据此只删除「本会话新增」的被忽略文件，绝不触碰会话开始前就存在的文件。
+   */
+  ignored?: Record<string, { size: number; mtimeMs: number }>
+  /** 被忽略路径索引是否因数量上限被截断；截断时回退不做被忽略路径清理（安全优先） */
+  ignoredTruncated?: boolean
 }
 
 export interface CheckpointOptions {
@@ -63,7 +88,10 @@ export interface CheckpointOptions {
   ignorePatterns?: readonly string[]
   /** 超过此大小的文件不计算哈希（仅根据 size+mtime 标记） */
   trackSizeCap?: number
-  /** 超过此大小的文件不保存内容 Blob（不可恢复内容） */
+  /**
+   * 单个文件可备份内容的上限。默认不限制（由 maxTotalBlobBytes 兜底）。
+   * 只有显式设为有限值时才存在此限制；被限制的文件在回退时会被跳过并上报。
+   */
   blobSizeCap?: number
   /** 单个工作区最大扫描追踪文件数量上限（防止超大目录死循环） */
   maxFiles?: number
@@ -71,6 +99,8 @@ export interface CheckpointOptions {
   maxTotalBlobBytes?: number
   /** 是否自动解析工作区根目录的 .gitignore 文件（默认为 true） */
   enableGitignore?: boolean
+  /** 扫描/备份文件的并发度（默认 8） */
+  ioConcurrency?: number
   /** 日志记录器 */
   logger?: { info?: (msg: string) => void; warn?: (msg: string) => void }
 }
@@ -82,6 +112,8 @@ export interface RestoreResult {
   restored: string[]
   deleted: string[]
   skipped: { path: string; reason: string }[]
+  /** 影响还原完整性的提示（例如基线可能已包含该轮改动） */
+  warnings?: string[]
   dryRun: boolean
 }
 
@@ -216,6 +248,9 @@ export async function writeAtomic(targetPath: string, data: string | Buffer): Pr
  * 递归遍历工作区目录并收集文件标识元数据。
  * 跳过符号链接（防止循环引用或越界），仅对 <= trackSizeCap 的文件计算哈希。
  * 当提供 previousFiles 时，尺寸与修改时间一致的文件直接复用旧哈希，无需重新读盘。
+ *
+ * 遍历分两阶段：先用 readdir/stat 收集候选文件（很快），再以有限并发计算哈希。
+ * 这样大工作区的基线采集窗口显著缩短，减少与首轮实际工作重叠的可能。
  */
 export async function walkWorkspace(
   root: string,
@@ -224,7 +259,7 @@ export async function walkWorkspace(
 ): Promise<Record<string, TrackedFile>> {
   const ignoreNames = options.ignoreNames ?? DEFAULT_IGNORE_NAMES
   const ignorePatterns = options.ignorePatterns ?? DEFAULT_IGNORE_PATTERNS
-  const trackSizeCap = options.trackSizeCap ?? 5 * 1024 * 1024
+  const trackSizeCap = options.trackSizeCap ?? DEFAULT_TRACK_SIZE_CAP
   const maxFiles = options.maxFiles ?? 100000
   const enableGitignore = options.enableGitignore ?? true
   const files: Record<string, TrackedFile> = {}
@@ -240,6 +275,8 @@ export async function walkWorkspace(
     }
   }
 
+  /** 待计算哈希的候选文件 */
+  const pending: { rel: string; absolute: string; size: number; mtimeMs: number }[] = []
   let count = 0
   let limitWarned = false
 
@@ -291,18 +328,112 @@ export async function walkWorkspace(
         continue
       }
 
-      let sha = ''
-      try {
-        sha = await hashFile(absolute)
-      } catch {
-        continue
-      }
-      files[rel] = { sha, size: info.size, mtimeMs: info.mtimeMs }
+      pending.push({ rel, absolute, size: info.size, mtimeMs: info.mtimeMs })
     }
   }
 
   await walk(rootAbs)
+
+  await runPool(pending, options.ioConcurrency ?? 8, async (item) => {
+    try {
+      const sha = await hashFile(item.absolute)
+      files[item.rel] = { sha, size: item.size, mtimeMs: item.mtimeMs }
+    } catch {
+      // 不可读文件跳过
+    }
+  })
   return files
+}
+
+/** 以有限并发执行任务队列 */
+export async function runPool<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return
+  const width = Math.max(1, Math.min(Math.floor(limit) || 1, items.length))
+  let next = 0
+  const runners = Array.from({ length: width }, async () => {
+    for (;;) {
+      const index = next
+      next += 1
+      if (index >= items.length) return
+      await worker(items[index])
+    }
+  })
+  await Promise.all(runners)
+}
+
+/**
+ * 收集被忽略路径的存在性索引（仅 size+mtime，不读内容、不计算哈希）。
+ *
+ * 这些路径不参与内容备份，但 agent 常往其中写产物（`dist/`、`*.log` 等），
+ * 回退时需要知道「哪些是会话开始前就有的」，因此必须记录基线。
+ * 依赖商店与版本控制等目录（{@link NEVER_SCAN_IGNORED_DIRS}）永不进入，避免开销失控。
+ *
+ * @param limit - 最多记录多少个条目；超出即截断并返回 `truncated: true`。
+ */
+export async function walkIgnoredPaths(
+  root: string,
+  options: CheckpointOptions = {},
+  limit = 20000,
+): Promise<{ entries: Record<string, { size: number; mtimeMs: number }>; truncated: boolean }> {
+  const ignoreNames = options.ignoreNames ?? DEFAULT_IGNORE_NAMES
+  const ignorePatterns = options.ignorePatterns ?? DEFAULT_IGNORE_PATTERNS
+  const enableGitignore = options.enableGitignore ?? true
+  const neverEnter = new Set(NEVER_SCAN_IGNORED_DIRS)
+  const entries: Record<string, { size: number; mtimeMs: number }> = {}
+  const rootAbs = resolve(root)
+
+  let gitignoreRules: GitignoreRule[] = []
+  if (enableGitignore) {
+    try {
+      const content = await readFile(join(rootAbs, '.gitignore'), 'utf8')
+      gitignoreRules = parseGitignore(content)
+    } catch {
+      // 无 .gitignore
+    }
+  }
+
+  let count = 0
+  let truncated = false
+
+  const walk = async (dir: string): Promise<void> => {
+    if (truncated) return
+    let listing
+    try {
+      listing = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of listing) {
+      if (count >= limit) {
+        truncated = true
+        return
+      }
+      if (neverEnter.has(entry.name)) continue
+      const absolute = join(dir, entry.name)
+      const rel = toRelative(rootAbs, absolute)
+      if (entry.isDirectory()) {
+        await walk(absolute)
+        continue
+      }
+      if (entry.isSymbolicLink() || !entry.isFile()) continue
+      // 只记录被忽略的路径；被追踪的文件已由 files 索引覆盖
+      if (!isIgnored(rel, ignoreNames, ignorePatterns, false, gitignoreRules)) continue
+      try {
+        const info = await stat(absolute)
+        entries[rel] = { size: info.size, mtimeMs: info.mtimeMs }
+        count += 1
+      } catch {
+        // 不可读文件跳过
+      }
+    }
+  }
+
+  await walk(rootAbs)
+  return { entries, truncated }
 }
 
 /** Base64 字符串解码为 Buffer */
@@ -335,7 +466,7 @@ function changedBlobs(
 export class CheckpointStore {
   private readonly dir: string
   private readonly root: string
-  private readonly options: Required<CheckpointOptions>
+  private readonly options: Required<Omit<CheckpointOptions, 'blobSizeCap'>> & { blobSizeCap: number }
   private baselineLoaded = false
   private baseline: Checkpoint | undefined
   private turnsLoaded = false
@@ -348,11 +479,14 @@ export class CheckpointStore {
     this.options = {
       ignoreNames: options.ignoreNames ?? DEFAULT_IGNORE_NAMES,
       ignorePatterns: options.ignorePatterns ?? DEFAULT_IGNORE_PATTERNS,
-      trackSizeCap: options.trackSizeCap ?? 5 * 1024 * 1024,
-      blobSizeCap: options.blobSizeCap ?? 1024 * 1024,
+      trackSizeCap: options.trackSizeCap ?? DEFAULT_TRACK_SIZE_CAP,
+      // 默认不限制单文件体积：真实项目里的锁文件、图片、数据集常常超过 1 MiB，
+      // 限制它们只会让回退静默漏掉改动。内存已由流式复制保证 O(1)。
+      blobSizeCap: options.blobSizeCap ?? Number.POSITIVE_INFINITY,
       maxFiles: options.maxFiles ?? 100000,
-      maxTotalBlobBytes: options.maxTotalBlobBytes ?? 500 * 1024 * 1024,
+      maxTotalBlobBytes: options.maxTotalBlobBytes ?? 512 * 1024 * 1024,
       enableGitignore: options.enableGitignore ?? true,
+      ioConcurrency: options.ioConcurrency ?? 8,
       logger: options.logger ?? {},
     }
   }
@@ -387,20 +521,30 @@ export class CheckpointStore {
     }
   }
 
-  /** 将工作区文件安全保存到 CAS 内容寻址池中（已存在则跳过写入） */
+  /**
+   * 将工作区文件以流式复制的方式保存到 CAS 内容寻址池（已存在则跳过）。
+   * 流式复制保证任意大小的文件都不会把内容读进内存。
+   */
   private async saveBlob(sha: string, sourcePath: string, size: number): Promise<boolean> {
-    if (size > this.options.blobSizeCap) return false
+    if (size > this.options.blobSizeCap) {
+      this.options.logger.warn?.(`[dsh-recover-context] 文件超过 blobSizeCap (${this.options.blobSizeCap} 字节)，未备份内容: ${sha}`)
+      return false
+    }
+    if (await this.hasBlob(sha)) return true
     if (this.totalBlobBytes + size > this.options.maxTotalBlobBytes) {
       this.options.logger.warn?.(`[dsh-recover-context] 会话 Blob 存储超出限制 (${this.options.maxTotalBlobBytes} 字节)，跳过存储 ${sha}`)
       return false
     }
-    if (await this.hasBlob(sha)) return true
+    const target = this.blobPath(sha)
+    const tmpPath = `${target}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
     try {
-      const data = await readFile(sourcePath)
-      await writeAtomic(this.blobPath(sha), data)
+      await mkdir(this.blobsDir(), { recursive: true })
+      await pipeline(createReadStream(sourcePath), createWriteStream(tmpPath))
+      await rename(tmpPath, target)
       this.totalBlobBytes += size
       return true
     } catch {
+      await rm(tmpPath, { force: true }).catch(() => undefined)
       return false
     }
   }
@@ -465,20 +609,51 @@ export class CheckpointStore {
    *
    * CAS 流式基线：将追踪的文件 Blob 逐个写入独立的 blobs/<sha> 磁盘文件（O(1) 内存开销），
    * baseline.json 仅持久化轻量级的元数据索引字典 `{ relPath: TrackedFile }`。
+   *
+   * 基线必须反映「本轮工作开始前」的状态。若扫描期间工作区已被改动（大仓库扫描较慢，
+   * 或插件到得很晚），基线里会混入本轮产物——这样的基线回退时无法撤销那些改动。
+   * 这里用 mtime 与扫描起始时间比较来识别该情况，并在回退时明确告警。
    */
   async ensureBaseline(now = Date.now()): Promise<Checkpoint> {
     await this.loadBaseline()
     if (this.baseline !== undefined) return this.baseline
     await mkdir(this.dir, { recursive: true })
+    const scanStartedAt = Date.now()
     const files = await walkWorkspace(this.root, this.options)
 
-    // 逐个流式写盘，内存不常驻任何大 Base64 对象
-    for (const [rel, file] of Object.entries(files)) {
-      if (file.sha === undefined) continue
-      await this.saveBlob(file.sha, join(this.root, rel), file.size)
+    let raced = false
+    for (const file of Object.values(files)) {
+      // 扫描期间被写入的文件说明工作已开始，基线可能已包含本轮产物。
+      if (file.mtimeMs >= scanStartedAt) {
+        raced = true
+        break
+      }
+    }
+    if (raced) {
+      this.options.logger.warn?.(
+        `[dsh-recover-context] 基线采集期间工作区仍在变化，基线可能已包含本轮改动（${this.root}）`,
+      )
     }
 
-    const baseline: Checkpoint = { kind: 'baseline', turn: 0, endSeq: -1, at: now, files }
+    // 并发流式写盘：任意大小的文件都不会整块读入内存
+    const entries = Object.entries(files).filter(([, file]) => file.sha !== undefined)
+    await runPool(entries, this.options.ioConcurrency, async ([rel, file]) => {
+      await this.saveBlob(file.sha as string, join(this.root, rel), file.size)
+    })
+
+    // 记录被忽略路径的基线存在性：回退时据此只删本会话新增的产物
+    const ignoredBaseline = await walkIgnoredPaths(this.root, this.options)
+
+    const baseline: Checkpoint = {
+      kind: 'baseline',
+      turn: 0,
+      endSeq: -1,
+      at: now,
+      files,
+      ...(raced ? { raced: true } : {}),
+      ignored: ignoredBaseline.entries,
+      ...(ignoredBaseline.truncated ? { ignoredTruncated: true } : {}),
+    }
     await writeAtomic(this.baselinePath(), JSON.stringify(baseline))
     this.baseline = baseline
     return baseline
@@ -496,15 +671,28 @@ export class CheckpointStore {
     const previous = await this.previousOf(turn)
     const files = await walkWorkspace(this.root, this.options, previous?.files)
 
-    // 保存本轮中新增或修改的文件至 CAS Blob 存储中
-    for (const [rel, file] of Object.entries(files)) {
-      if (file.sha === undefined) continue
+    // 并发保存本轮中新增或修改的文件至 CAS Blob 存储
+    const changed = Object.entries(files).filter(([rel, file]) => {
+      if (file.sha === undefined) return false
       const before = previous?.files[rel]
-      if (before !== undefined && before.sha === file.sha) continue
-      await this.saveBlob(file.sha, join(this.root, rel), file.size)
-    }
+      return before === undefined || before.sha !== file.sha
+    })
+    await runPool(changed, this.options.ioConcurrency, async ([rel, file]) => {
+      await this.saveBlob(file.sha as string, join(this.root, rel), file.size)
+    })
 
-    const checkpoint: Checkpoint = { kind: 'turn', turn, endSeq, at: now, files }
+    // 逐轮同样记录被忽略路径的存在性（内容不备份），供回退时判断新增产物
+    const ignoredSnapshot = await walkIgnoredPaths(this.root, this.options)
+
+    const checkpoint: Checkpoint = {
+      kind: 'turn',
+      turn,
+      endSeq,
+      at: now,
+      files,
+      ignored: ignoredSnapshot.entries,
+      ...(ignoredSnapshot.truncated ? { ignoredTruncated: true } : {}),
+    }
     await writeAtomic(this.turnPath(turn), JSON.stringify(checkpoint))
     this.turns.set(turn, checkpoint)
     return checkpoint
@@ -605,6 +793,19 @@ export class CheckpointStore {
     const checkpoint = target.checkpoint
     const current = await walkWorkspace(this.root, this.options)
 
+    // 被忽略路径（.gitignore / ignoreNames / ignorePatterns）的内容不在 files 索引里，
+    // 但 agent 常往这些地方写产物（dist/、*.log 等）。回退时只删除「目标快照里没有、
+    // 但现在存在」的被忽略文件；目标快照里已存在的（会话开始前就有的）绝不触碰。
+    // 快照缺少该索引（旧版本数据）或索引被截断时保守跳过，避免误删用户文件。
+    const ignoredNow = await walkIgnoredPaths(this.root, this.options)
+    const canCleanIgnored = checkpoint.ignored !== undefined && checkpoint.ignoredTruncated !== true && ignoredNow.truncated !== true
+    const ignoredLeftovers = new Set<string>()
+    if (canCleanIgnored) {
+      for (const rel of Object.keys(ignoredNow.entries)) {
+        if (checkpoint.ignored?.[rel] === undefined) ignoredLeftovers.add(rel)
+      }
+    }
+
     // 兼容旧版内联 Blobs 的查询回退表
     const legacyBlobsAt = new Map<string, string>()
     const ordered: Checkpoint[] = []
@@ -629,6 +830,19 @@ export class CheckpointStore {
       const abs = absolute(rel)
       return abs === this.root || abs.startsWith(this.root + sep)
     }
+    /** 删除后清理空目录，避免留下空壳构建目录 */
+    const pruneEmptyDirs = async (relPath: string): Promise<void> => {
+      let dir = dirname(absolute(relPath))
+      while (dir !== this.root && dir.startsWith(this.root + sep)) {
+        try {
+          // rmdir 只删空目录：非空时抛 ENOTEMPTY，恰好用来停止上溯
+          await rmdir(dir)
+        } catch {
+          return
+        }
+        dir = dirname(dir)
+      }
+    }
 
     // 1. 当前存在但目标快照中不存在的文件 → 删除
     for (const rel of Object.keys(current)) {
@@ -640,6 +854,23 @@ export class CheckpointStore {
       }
       try {
         await rm(absolute(rel), { force: true })
+        await pruneEmptyDirs(rel)
+        deleted.push(rel)
+      } catch {
+        skipped.push({ path: rel, reason: 'delete-failed' })
+      }
+    }
+
+    // 1b. 被忽略路径中、快照里不存在的残留产物 → 也删除
+    for (const rel of ignoredLeftovers) {
+      if (!within(rel)) continue
+      if (dryRun) {
+        deleted.push(rel)
+        continue
+      }
+      try {
+        await rm(absolute(rel), { force: true })
+        await pruneEmptyDirs(rel)
         deleted.push(rel)
       } catch {
         skipped.push({ path: rel, reason: 'delete-failed' })
@@ -654,27 +885,52 @@ export class CheckpointStore {
       if (same) continue
 
       if (file.sha === undefined) {
+        // 超过 trackSizeCap 的文件只记录了 size+mtime，没有可供还原的内容
         skipped.push({ path: rel, reason: 'too-large' })
         continue
       }
 
-      const legacyBlob = legacyBlobsAt.get(rel)
-      const blobBuffer = await this.getBlob(file.sha, legacyBlob)
-      if (blobBuffer === null) {
-        skipped.push({ path: rel, reason: 'no-content' })
+      const target_ = absolute(rel)
+      if (dryRun) {
+        const available = await this.hasBlob(file.sha) || legacyBlobsAt.has(rel)
+        if (available) restored.push(rel)
+        else skipped.push({ path: rel, reason: 'no-content' })
         continue
       }
 
-      if (dryRun) {
-        restored.push(rel)
-        continue
-      }
       try {
-        await writeAtomic(absolute(rel), blobBuffer)
+        await mkdir(dirname(target_), { recursive: true })
+        if (await this.hasBlob(file.sha)) {
+          // CAS 命中：流式复制，避免把大文件整块读进内存
+          const tmpPath = `${target_}.${Date.now()}.${Math.random().toString(36).slice(2)}.rc-tmp`
+          try {
+            await pipeline(createReadStream(this.blobPath(file.sha)), createWriteStream(tmpPath))
+            await rename(tmpPath, target_)
+          } catch (error) {
+            await rm(tmpPath, { force: true }).catch(() => undefined)
+            throw error
+          }
+          restored.push(rel)
+          continue
+        }
+        const legacyBlob = legacyBlobsAt.get(rel)
+        if (legacyBlob === undefined) {
+          skipped.push({ path: rel, reason: 'no-content' })
+          continue
+        }
+        await writeAtomic(target_, decodeBlob(legacyBlob))
         restored.push(rel)
       } catch {
         skipped.push({ path: rel, reason: 'write-failed' })
       }
+    }
+
+    // 还原完整性告警：基线若在采集期间已被本轮改动污染，无法撤销那部分改动
+    const warnings: string[] = []
+    if (checkpoint.kind === 'baseline' && checkpoint.raced === true) {
+      warnings.push(
+        'baseline-race: 基线是在工作区仍在变化时采集的，可能已包含本轮改动，这些改动无法通过回退撤销',
+      )
     }
 
     return {
@@ -683,6 +939,7 @@ export class CheckpointStore {
       restored,
       deleted,
       skipped,
+      ...(warnings.length === 0 ? {} : { warnings }),
       dryRun,
     }
   }
