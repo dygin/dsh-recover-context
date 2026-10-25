@@ -1,10 +1,14 @@
 /**
- * Minimal zh/en copy for the recover-context buttons. The active locale is
- * read from the locale service at client start and on locale switches
- * (module-level flag — same pattern as dsh-context's attachLocale).
+ * recover-context 按钮的中英文文案。
+ *
+ * 通过 `ctx.locale.register(NS, { zh, en })` 注册字典命名空间；注册插槽时传
+ * `locale: NS`，框架会把绑定好的 `t` 作为组件 props 下发。
  */
 
-const ZH: Record<string, string> = {
+/** 本插件拥有的字典命名空间 */
+export const NS = 'recover-context'
+
+export const ZH: Record<string, string> = {
   rollback: '回退到此',
   rollbackConfirm: '确认回退？将丢弃此后的对话并还原工作区文件',
   rollbackConfirmShort: '确认回退？',
@@ -18,7 +22,7 @@ const ZH: Record<string, string> = {
   cancel: '取消',
 }
 
-const EN: Record<string, string> = {
+export const EN: Record<string, string> = {
   rollback: 'Roll back here',
   rollbackConfirm: 'Confirm rollback? This discards later turns and restores workspace files',
   rollbackConfirmShort: 'Confirm?',
@@ -32,27 +36,10 @@ const EN: Record<string, string> = {
   cancel: 'Cancel',
 }
 
-let zh = true
+/** 翻译函数（由框架 locale 命名空间绑定后下发） */
+export type Translate = (key: string, params?: Record<string, string | number>) => string
 
-/** Bind the module-level locale flag to the locale service (disposer). */
-export function attachLocale(locale: {
-  getSnapshot(): { active: string }
-  subscribe(fn: () => void): () => void
-}): () => void {
-  const sync = (): void => { zh = locale.getSnapshot().active === 'zh' }
-  sync()
-  const off = locale.subscribe(sync)
-  return off
-}
-
-/** Translate one key with optional {placeholders}. */
-export function t(key: string, params?: Record<string, string | number>): string {
-  const table = zh ? ZH : EN
-  let text = table[key] ?? key
-  if (params !== undefined) {
-    for (const [name, value] of Object.entries(params)) {
-      text = text.replaceAll(`{${name}}`, String(value))
-    }
-  }
-  return text
+/** 不带框架 locale 时的后备翻译（按 key 原样返回） */
+export function fallbackTranslate(key: string): string {
+  return key
 }

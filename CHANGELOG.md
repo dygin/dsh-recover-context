@@ -4,6 +4,36 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，并遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.7] - 2026-10-25
+
+### 适配 DeepSeek Harness 0.2.1-rc.2
+
+DSH 0.2.x 重构了宿主服务与浏览器插件契约，旧版本插件在此环境下无法激活。本版本完成全面迁移：
+
+- **宿主端路由改用 Connection 精确 Fetch 路由**：`/api/recover-context/checkpoints` 与
+  `/api/recover-context/restore` 通过 `ctx.connection.fetch.register` 注册，自动继承 Connection 的
+  浏览器认证与 Host/Origin 信任域校验。没有 Connection 的部署仍回退到 `ctx.webServer` 自建路由 + 本地信任校验。
+- **会话事件读取改用 SessionPersistence**：不再依赖已废弃的同步事件读取，改为
+  `ctx.sessionPersistence.open(id, 'read')` 逐次读取事件日志，读后立即关闭句柄；cwd 也从
+  `stat().header.cwd` 获取。
+- **客户端改用 `uiConversation` / `useChat` 契约**：会话节点通过 `ctx.uiConversation.events.register`
+  注册；`recover-actions` 渲染器与输入框入口改用框架下发的 `useChat` 标准钩子读取 ChatSnapshot
+  （`order` / `nodes` / `locations` / `legacy.turnEnds`）。
+- **回退后的导航改用官方 Workspace 流程**：`rollback` 通过 `ctx.uiWorkspace.openSession` 打开子会话；
+  首问场景通过 `uiWorkspace.connectWorkspace` 在工作区中解析空白会话，随后 `openSession`，
+  避免出现“会话已创建但界面未打开”的悬空状态。
+- **节点归属轮次输入层**：`recover-actions` 节点声明 `groupTree: 'input'`，否则会被并入可折叠的
+  turn-process 组，折叠时操作行随之隐藏。
+- **字典改用 `ctx.locale.register`**：注册 `recover-context` 命名空间，插槽声明 `locale`，
+  翻译函数由框架通过 `t` 下发。
+- **包元数据**：新增 `engines.dsh: ">=0.2.1-rc.2"`；`dsh.client.inject` 更新为当前真实提供的
+  客户端包列表。
+
+### 修复
+
+- 修复回退时因访问未注入的 `ctx.workspaces` 而报 `cannot get property "workspaces" without inject` 的问题。
+- 编辑问题后提交时不再把旧会话的提交回声 `requestId` 转交给子会话。
+
 ## [1.0.6] - 2026-09-01
 
 ### 修复与优化

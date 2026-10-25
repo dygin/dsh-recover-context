@@ -1,6 +1,6 @@
 {
   "name": "dsh-recover-context",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "DSH web plugin: roll back to before any of your questions, or edit the last one and resubmit, restoring the workspace files the discarded turns produced.",
   "author": "dsh_recover_context",
   "repository": {
@@ -27,8 +27,11 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node tests/checkpoints.test.mjs && node tests/host.test.mjs && node scripts/test-client-logic.mjs",
+    "test": "npm run typecheck && npm run build && node tests/checkpoints.test.mjs && node tests/host.test.mjs && node scripts/test-client-logic.mjs && node tests/client-render.test.mjs",
     "release": "bash scripts/publish.sh"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2"
   },
   "dsh": {
     "bundle": {
@@ -36,10 +39,14 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-api-session-controller",
         "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session",
         "@deepseek-ai/dsh-client-ui-slots",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-client-ui-workspace"
       ],
       "platform": "web"
     }

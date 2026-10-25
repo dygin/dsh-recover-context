@@ -1,21 +1,24 @@
 /**
  * 输入框工具栏操作组件：
  * 当 Agent 仍在回答上一问题时（误提交场景），提供“编辑此问题”按钮，
- * 用户可将问题拉回输入框修改重发 — 取代错误上下文，而无需苦等不再需要的回答生成完毕。
- * 注册至 `conversation.input.left` 插槽。
+ * 用户可将问题拉回输入框修改重发。注册至 `conversation.input.left` 插槽。
  */
 import { useState } from 'react'
 import type { ClientContext } from './actions.ts'
 import { beginEdit } from './actions.ts'
-import { t } from './locales.ts'
-import { analyzeComposerEdit, type SnapshotLike } from './snapshot.ts'
+import { fallbackTranslate, type Translate } from './locales.ts'
+import { analyzeComposerEdit, type ChatSnapshotLike } from './snapshot.ts'
 
-/** 输入框左侧插槽属性 */
+/** 输入框左侧插槽属性（InputZone owner + 标准会话 props） */
 export interface ComposerEditProps {
-  /** 会话快照 */
-  session: SnapshotLike
+  /** 当前会话快照（SessionSnapshot 结构子集） */
+  session: { running: boolean; removed: boolean }
+  /** Chat 快照选择器 */
+  useChat: <T>(selector: (snap: ChatSnapshotLike) => T) => T
   /** 会话 ID */
   sessionId: string
+  /** 框架 locale 命名空间绑定的翻译函数 */
+  t?: Translate
 }
 
 /** 铅笔图标 */
@@ -55,8 +58,10 @@ export function ComposerEdit(props: ComposerEditProps & { ctx: ClientContext }):
 }
 
 function ComposerEditInner(props: ComposerEditProps & { ctx: ClientContext }): JSX.Element | null {
-  const { session, sessionId, ctx } = props
-  const info = analyzeComposerEdit(session)
+  const { session, sessionId, useChat, ctx } = props
+  const t = props.t ?? fallbackTranslate
+  const chat = useChat(snap => snap)
+  const info = analyzeComposerEdit(chat, session.running && !session.removed)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 

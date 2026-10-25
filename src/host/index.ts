@@ -1,12 +1,14 @@
 /**
- * dsh-recover-context 宿主端入口。
+ * dsh-recover-context 宿主端入口（适配 DSH 0.2.1-rc.2）。
  *
  * 两大核心职责：
- *  1. 工作区检查点采集 — 监听会话事件流（session/event），在基线时刻（首次观察到事件）
- *     以及每个轮次完成时（turn/end）记录工作区目录状态，确保在回滚时能精准还原被撤销轮次产生的文件变更。
- *  2. /recover-context JSON API — 提供检查点查询列表与工作区恢复还原接口。
- *     会话本身的对话回滚由前端客户端基于原生 session.fork 与 workspace.archiveSession 完成，
- *     宿主端补充对应的工作区目录状态还原能力。
+ *  1. 工作区检查点采集 — 监听 `session/event` 事件流，在基线时刻（首次观察到事件）
+ *     与每个轮次完成时（`turn/end`）记录工作区目录状态，确保回滚时能精准还原
+ *     被撤销轮次产生的文件变更。
+ *  2. /api/recover-context JSON API — 提供检查点查询与工作区还原。
+ *     路由通过 `ctx.connection.fetch` 注册，因而自动复用 Connection 的浏览器
+ *     认证与 Host/Origin 信任域校验；无 Connection 服务时退回 `ctx.webServer`
+ *     的自建路由 + 本地信任校验。
  *
  * 存储路径（位于 DSH 主目录下，绝不污染用户工作区）：
  *   <dshHome>/storages/recover-context/<sessionId>/baseline.json
@@ -19,64 +21,80 @@ import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { CheckpointStore, type CheckpointOptions } from './checkpoints.ts'
 import {
-  RecoverError, isTrustedApiRequest, optionalBoolean, optionalNumber,
-  readJsonBody, requireString, writeError, writeJson, writeOk,
+  RecoverError, errorResponse, isTrustedNodeRequest, okResponse, optionalBoolean,
+  optionalNumber, readJsonRequest, readNodeJsonBody, requireString,
+  writeNodeError, writeNodeJson, writeNodeOk,
 } from './wire.ts'
 
 /** 插件名称 */
 export const name = 'dsh-recover-context'
 
-/** 挂载前依赖注入的服务 */
-export const inject = ['webServer', 'sessions', 'webRuntime']
+/** 挂载前依赖注入的服务（sessionPersistence / connection 按需可选读取） */
+export const inject = ['webServer', 'sessions']
 
 // 重新导出引擎核心实现，便于外部消费者与独立测试直接使用
 export { CheckpointStore, isIgnored, walkWorkspace, parseGitignore, matchesGitignore, hashFile, writeAtomic } from './checkpoints.ts'
 export type { Checkpoint, CheckpointOptions, RestoreResult, TrackedFile, GitignoreRule } from './checkpoints.ts'
 
-/** 会话存储对象的结构镜像 */
+/** 会话存储对象的结构镜像（取插件实际读取的字段） */
 interface SessionLike {
   id: string
   header: { cwd?: string; origin?: 'subagent'; id: string }
-  events: readonly { type: string; seq: number; data?: { turn?: number } }[]
+  /** 旧版实时快照读取（持久化服务缺失时的回退） */
+  snapshotEvents?(): readonly EventLike[]
 }
 
 /** 单个事件行的结构镜像 */
 interface EventLike {
   type: string
   seq: number
-  data?: { turn?: number }
+  time?: number
+  data?: { turn?: number; reason?: unknown }
 }
 
-/** Web 运行时的信任域结构镜像 */
-interface WebRuntimeLike {
-  trustedHosts: readonly string[]
+/** 可选的会话持久化服务接口镜像（DSH 0.2.1 的 SessionPersistence） */
+interface SessionPersistenceLike {
+  stat(id: string): Promise<{ header: { cwd?: string } } | undefined>
+  open(id: string, access: 'read' | 'write', options?: { signal?: AbortSignal }): Promise<{
+    read(offset?: number, length?: number): Promise<{ events: readonly EventLike[] }>
+    close(): Promise<void>
+  }>
 }
 
-/** 可选的会话持久化服务接口镜像 */
-interface PersistenceLike {
-  inspect(id: string): Promise<{ meta: { cwd?: string }; events: readonly EventLike[] }>
+/** Connection 精确 Fetch 路由注册接口镜像 */
+interface ConnectionLike {
+  fetch: {
+    register(route: {
+      path: string
+      methods: readonly string[]
+      requestBody: 'buffered' | 'streaming'
+      fetch(request: Request): Promise<Response>
+    }): () => Promise<void>
+  }
+}
+
+/** WebServer 原生路由注册接口镜像 */
+interface WebServerLike {
+  register(route: {
+    kind: 'exact' | 'prefix'
+    path: string
+    handler(req: unknown, res: unknown): void | Promise<void>
+  }): () => void
 }
 
 /** 宿主上下文接口镜像 */
 export interface RecoverContext {
-  effect(fn: () => void | (() => void), label?: string): void
+  effect(fn: () => void | (() => void) | Promise<void | (() => void)>, label?: string): void
   on(event: string, listener: (session: SessionLike, event: EventLike) => void): () => void
   sessions: {
     get(id: string): SessionLike | undefined
   }
-  webServer: {
-    register(route: {
-      kind: 'exact' | 'prefix'
-      path: string
-      handler(req: unknown, res: unknown): void | Promise<void>
-    }): () => void
-  }
-  webRuntime: WebRuntimeLike
+  webServer: WebServerLike
   get<T>(key: string): T | undefined
   logger: { info(message: string): void; warn(message: string): void }
 }
 
-/** 解析 DSH 根主目录路径 */
+/** 解析 DSH 根主目录路径（优先级：$DSH_HOME → ~/.dsh） */
 function dshHome(): string {
   const env = process.env.DSH_HOME
   if (env !== undefined && env.trim() !== '') return resolve(env)
@@ -132,16 +150,21 @@ export function apply(ctx: RecoverContext): void {
     return next
   }
 
+  /** 读取会话持久化服务（Web 组合中由 session-persistence-jsonl 提供） */
+  function persistence(): SessionPersistenceLike | undefined {
+    return ctx.get<SessionPersistenceLike>('sessionPersistence')
+  }
+
   /** 获取指定会话的工作区根目录 */
   async function workspaceRootOf(sessionId: string): Promise<string | undefined> {
     const live = ctx.sessions.get(sessionId)
     const liveCwd = live?.header.cwd
     if (liveCwd !== undefined && liveCwd !== '') return liveCwd
-    const persistence = ctx.get<PersistenceLike>('sessionPersistence')
-    if (persistence === undefined) return undefined
+    const store = persistence()
+    if (store === undefined) return undefined
     try {
-      const inspected = await persistence.inspect(sessionId)
-      return inspected.meta.cwd
+      const snapshot = await store.stat(sessionId)
+      return snapshot?.header.cwd
     } catch {
       return undefined
     }
@@ -185,16 +208,29 @@ export function apply(ctx: RecoverContext): void {
     return off
   }, 'dsh-recover-context: session checkpoint feed')
 
-  /** 读取会话的事件日志（优先从活跃会话中读取，其次从持久化中读取） */
+  /** 读取会话的事件日志（优先持久化服务，其次旧的实时快照） */
   async function eventsOf(sessionId: string): Promise<readonly EventLike[]> {
-    const live = ctx.sessions.get(sessionId)
-    if (live !== undefined) return live.events
-    const persistence = ctx.get<PersistenceLike>('sessionPersistence')
-    if (persistence !== undefined) {
+    const store = persistence()
+    if (store !== undefined) {
+      let handle
       try {
-        return (await persistence.inspect(sessionId)).events
+        handle = await store.open(sessionId, 'read')
+        const result = await handle.read()
+        return result.events
       } catch {
-        // 忽略读取错误
+        // 持久化不可用 → 回退到实时快照
+      } finally {
+        if (handle !== undefined) {
+          await handle.close().catch(() => undefined)
+        }
+      }
+    }
+    const live = ctx.sessions.get(sessionId)
+    if (live?.snapshotEvents !== undefined) {
+      try {
+        return live.snapshotEvents()
+      } catch {
+        // 忽略读取失败
       }
     }
     return []
@@ -219,7 +255,7 @@ export function apply(ctx: RecoverContext): void {
 
     /**
      * 将工作区目录还原到回滚点。
-     * atSeq 指定截断锚点；baseline: true 恢复到初始状态；dryRun 仅做预检返回受影响文件清单。
+     * atSeq 指定截断锚点；baseline: true 恢复到初始状态；dryRun 仅做预检。
      */
     async restore(payload: unknown): Promise<unknown> {
       const sessionId = requireString(payload, 'sessionId')
@@ -237,38 +273,81 @@ export function apply(ctx: RecoverContext): void {
     },
   }
 
-  // ── JSON API 路由注册 ──────────────────────────────────────────────────
+  /** 按方法名分发一次 API 调用 */
+  async function dispatch(method: string, payload: unknown): Promise<unknown> {
+    if (method !== 'checkpoints' && method !== 'restore') {
+      throw new RecoverError('not-found', `未知的 recover-context API 方法 "${method}"`, 404)
+    }
+    return api[method](payload)
+  }
+
+  // ── 首选：Connection 精确 Fetch 路由（自动获得浏览器认证与信任域校验） ──
+  const connection = ctx.get<ConnectionLike>('connection')
+  const routes = [
+    { method: 'checkpoints', path: '/api/recover-context/checkpoints' },
+    { method: 'restore', path: '/api/recover-context/restore' },
+  ] as const
+
+  if (connection !== undefined) {
+    ctx.effect(() => {
+      const disposers = routes.map(route => connection.fetch.register({
+        path: route.path,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request: Request): Promise<Response> => {
+          if (request.method !== 'POST') {
+            return Response.json(
+              { ok: false, error: { code: 'method-error', message: 'method not allowed' } },
+              { status: 405 },
+            )
+          }
+          try {
+            const payload = await readJsonRequest(request)
+            return okResponse(await dispatch(route.method, payload))
+          } catch (error) {
+            return errorResponse(error)
+          }
+        },
+      }))
+      return async () => {
+        await Promise.allSettled(disposers.map(dispose => dispose()))
+      }
+    }, 'dsh-recover-context: /api/recover-context fetch routes')
+    return
+  }
+
+  // ── 回退：原生 HTTP 路由（无 Connection 的部署） ────────────────────────
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
-    path: '/recover-context/api',
+    path: '/api/recover-context',
     handler: async (req, res) => {
-      if (!isTrustedApiRequest(req as { headers: import('node:http').IncomingHttpHeaders }, ctx.webRuntime.trustedHosts)) {
-        writeJson(res as never, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
+      const request = req as { method?: string; url?: string; headers: Record<string, string | string[] | undefined> }
+      const response = res as {
+        writeHead(status: number, headers?: Record<string, string>): unknown
+        end(body?: string): unknown
+      }
+      if (!isTrustedNodeRequest(request as never, [])) {
+        writeNodeJson(response as never, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
         return
       }
-      if ((req as { method?: string }).method !== 'POST') {
-        writeJson(res as never, 405, { ok: false, error: { code: 'method-error', message: 'method not allowed' } })
+      if (request.method !== 'POST') {
+        writeNodeJson(response as never, 405, { ok: false, error: { code: 'method-error', message: 'method not allowed' } })
         return
       }
-      const url = new URL((req as { url?: string }).url ?? '/', 'http://dsh.internal')
-      const pathname = url.pathname
-      const method = pathname.startsWith('/recover-context/api/')
-        ? pathname.slice('/recover-context/api/'.length)
+      const url = new URL(request.url ?? '/', 'http://dsh.internal')
+      const method = url.pathname.startsWith('/api/recover-context/')
+        ? url.pathname.slice('/api/recover-context/'.length)
         : undefined
       if (method === undefined || method.includes('/')) {
-        writeError(res as never, new RecoverError('not-found', '未知的 recover-context API 方法', 404))
+        writeNodeError(response as never, new RecoverError('not-found', '未知的 recover-context API 方法', 404))
         return
       }
       try {
-        const payload = await readJsonBody(req as never)
-        const handler = (api as Record<string, (value: unknown) => Promise<unknown>>)[method]
-        if (handler === undefined) {
-          throw new RecoverError('not-found', `未知的 recover-context API 方法 "${method}"`, 404)
-        }
-        writeOk(res as never, await handler(payload))
+        const payload = await readNodeJsonBody(req as never)
+        writeNodeOk(response as never, await dispatch(method, payload))
       } catch (error) {
-        writeError(res as never, error)
+        writeNodeError(response as never, error)
       }
     },
-  }), 'dsh-recover-context: /recover-context/api routes')
+  }), 'dsh-recover-context: /api/recover-context fallback routes')
 }

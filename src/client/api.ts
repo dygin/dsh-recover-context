@@ -1,10 +1,10 @@
 /**
- * Client fetch wrapper over the /recover-context JSON API. Every call posts
- * to `/recover-context/api/<method>`; failures surface as plain Errors with
- * the wire message.
+ * 客户端对 /api/recover-context JSON API 的 fetch 封装。
+ * 所有调用向 `/api/recover-context/<method>` 发送 POST 请求；失败时抛出带
+ * 网络错误信息的普通 Error。
  */
 
-/** Restore result mirrored from the host. */
+/** 宿主返回的恢复结果镜像 */
 export interface RestoreResult {
   mode: 'turn' | 'baseline' | 'none'
   boundary?: { turn: number; endSeq: number }
@@ -14,7 +14,7 @@ export interface RestoreResult {
   dryRun: boolean
 }
 
-/** Checkpoint listing mirrored from the host. */
+/** 检查点列表摘要项 */
 export interface CheckpointSummary {
   turn: number
   endSeq: number
@@ -28,16 +28,18 @@ export interface CheckpointsResult {
   checkpoints: CheckpointSummary[]
 }
 
-/** Wire envelope of one recover-context method. */
+/** 单个方法的线上响应信封 */
 interface Wire<T> {
   ok?: boolean
   value?: T
   error?: { code?: string; message?: string }
 }
 
-/** Call one recover-context host method. */
+const API_BASE = '/api/recover-context'
+
+/** 调用一个 recover-context 宿主方法 */
 export async function callApi<T>(method: string, payload: unknown): Promise<T> {
-  const response = await fetch(`/recover-context/api/${method}`, {
+  const response = await fetch(`${API_BASE}/${method}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
@@ -46,10 +48,10 @@ export async function callApi<T>(method: string, payload: unknown): Promise<T> {
   try {
     body = await response.json() as Wire<T>
   } catch {
-    // non-JSON body → fall through to the generic error
+    // 非 JSON 响应 → 走通用错误
   }
   if (body === null || body.ok !== true) {
-    const message = body?.error?.message ?? `recover-context ${method} failed (HTTP ${response.status})`
+    const message = body?.error?.message ?? `recover-context ${method} 调用失败 (HTTP ${response.status})`
     throw new Error(message)
   }
   return body.value as T

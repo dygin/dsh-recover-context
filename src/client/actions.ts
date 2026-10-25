@@ -1,26 +1,30 @@
 /**
- * 客户端回滚与编辑操作编排。
- * 两项操作均建立在 DSH 原生机制之上 — `session.fork`（原生分叉功能）与 `workspace.archiveSession`（归档旧会话），
- * 并结合本插件宿主提供的目录快照恢复 API：
+ * 客户端回滚与编辑操作编排（适配 DSH 0.2.1 的 sessions / uiWorkspace 契约）。
  *
  *   rollback / rollbackBefore（回滚）:
- *     取消当前运行的轮次 → 分叉出目标截断点之前的新会话 →
- *     恢复工作区到对应检查点 → 归档旧会话 → 打开新子会话。
+ *     取消当前运行的轮次 → 分叉出目标截断点之前的会话（或创建空白子会话）→
+ *     恢复工作区到对应检查点 → 归档旧会话 → 打开新会话。
  *
  *   beginEdit（编辑问题）:
- *     点击时不会截断任何上下文：仅将原问题文本载入输入框并装载提交拦截器；
- *     截断（fork + 恢复 + 归档）仅在用户实际点击提交时触发。
+ *     点击时不做任何截断：仅将原问题载入输入框并装载 prompt 拦截器；
+ *     真正的截断（fork + 恢复 + 归档）在用户点击提交时执行。
  */
 import { callApi, type RestoreResult } from './api.ts'
 
-/** 单次提问提交的结构镜像 */
+/** 提问内容块（结构镜像） */
 type PromptContent = readonly { type: string; text?: string }[]
-type PromptResult = { ok: boolean; error?: { code: string; message: string } }
+/** 提问结果（RemoteResult 的结构子集） */
+type PromptResult = { ok: boolean; error?: { code?: string; message: string } }
 
-/** 支持 patch 拦截 prompt 的会话绑定对象镜像 */
+/** 可拦截 prompt 的会话面（SessionFace 的结构子集） */
 interface PatchableSession {
   cancel(): Promise<unknown>
-  prompt(content: PromptContent, mode: string): Promise<PromptResult>
+  prompt(
+    content: PromptContent,
+    mode: string,
+    signal?: AbortSignal,
+    requestId?: unknown,
+  ): Promise<PromptResult>
 }
 
 /** 客户端上下文镜像 */
@@ -30,17 +34,16 @@ export interface ClientContext {
     binding(id: string): { session: PatchableSession } | undefined
     fork(opts: { sessionId: string; atSeq?: number }): Promise<string>
     create(opts: { workspaceId?: string; cwd?: string }): Promise<string>
-    open(id: string): void
     scope(id: string): unknown | undefined
     list: {
       getSnapshot(): { byId: Record<string, { cwd?: string }> }
     }
   }
-  workspaces: {
-    archiveSession(sessionId: string): Promise<void>
-    list: {
-      getSnapshot(): { items: readonly { id: string; path: string }[] }
-    }
+  uiWorkspace: {
+    openSession(target: string): void
+    archiveSession(sessionId: string, options?: { stopActivity?: boolean }): Promise<void>
+    /** 在工作区中解析（复用或新建）一个空白会话，返回会话 id。 */
+    connectWorkspace?(workspaceId: string): Promise<string>
   }
 }
 
@@ -55,7 +58,7 @@ export interface RecoverOperationResult {
  */
 const armedEdits = new Map<string, { boundarySeq: number | null }>()
 
-/** 判断某会话是否处于编辑拦截就绪状态 */
+/** 判断某会话是否处于编辑拦截就绪状态（导出供测试使用） */
 export function isEditArmed(sessionId: string): boolean {
   return armedEdits.has(sessionId)
 }
@@ -74,7 +77,7 @@ async function cancelIfRunning(ctx: ClientContext, sessionId: string): Promise<v
 /** 归档旧会话（尽力而为） */
 async function archive(ctx: ClientContext, sessionId: string): Promise<void> {
   try {
-    await ctx.workspaces.archiveSession(sessionId)
+    await ctx.uiWorkspace.archiveSession(sessionId, { stopActivity: true })
   } catch {
     // 归档属于界面整理，不阻塞新会话
   }
@@ -83,7 +86,7 @@ async function archive(ctx: ClientContext, sessionId: string): Promise<void> {
 /** 将文本填入会话输入框草稿区（重试直到作用域就绪） */
 async function setDraftOn(ctx: ClientContext, sessionId: string, text: string): Promise<void> {
   const conversation = ctx.get<{
-    input: { for(actx: unknown): { setDraft(text: string): void } }
+    input: { for(actx: unknown): { setDraft(value: string): void } }
   }>('conversation')
   if (conversation === undefined) return
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -100,9 +103,29 @@ async function setDraftOn(ctx: ClientContext, sessionId: string, text: string): 
   }
 }
 
+/** 解析会话所属的工作区 id 与工作目录 */
+function workspaceOf(ctx: ClientContext, sessionId: string): { workspaceId?: string; cwd?: string } {
+  const cwd = ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd
+  // workspaces 服务不在 inject 中：按框架约定用 ctx.get 读取（缺失时降级为 cwd）。
+  const workspaces = ctx.get<{
+    list: { getSnapshot(): { items: readonly { workspaceId: string; sessionIds: readonly string[]; path: string }[] } }
+  }>('workspaces')
+  if (workspaces !== undefined) {
+    const items = workspaces.list.getSnapshot().items
+    const byMembership = items.find(item => item.sessionIds.includes(sessionId))
+    if (byMembership !== undefined) return { workspaceId: byMembership.workspaceId, ...(cwd === undefined ? {} : { cwd }) }
+    if (cwd !== undefined) {
+      const byPath = items.find(item => item.path === cwd)
+      if (byPath !== undefined) return { workspaceId: byPath.workspaceId, cwd }
+    }
+  }
+  return cwd === undefined ? {} : { cwd }
+}
+
 /**
- * 通用的“截断到某个问题之前”操作：在上一已完成轮次处分叉（或对首个问题创建空白子会话），
- * 恢复工作区到该时间点，归档旧会话并打开新子会话。
+ * 通用的“截断到某个问题之前”操作。
+ * @param boundarySeqOrNull 上一已完成轮次的 turn/end seq；null 表示首个问题
+ * @param draftText 截断后载入新会话输入框的文本
  */
 async function cutBefore(
   ctx: ClientContext,
@@ -111,22 +134,27 @@ async function cutBefore(
   draftText?: string,
 ): Promise<RecoverOperationResult> {
   await cancelIfRunning(ctx, sessionId)
+
   let childId: string
   let restore: RestoreResult
+
   if (boundarySeqOrNull === null) {
-    // 第一个问题：无法基于已完成轮次 fork，因此创建相同工作区的全新空白会话并还原基线文件
-    const cwd = ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd
-    const workspace = ctx.workspaces.list.getSnapshot().items.find(item => item.path === cwd)
-    childId = await ctx.sessions.create(workspace !== undefined
-      ? { workspaceId: workspace.id }
-      : cwd !== undefined ? { cwd } : {})
+    // 第一个问题：先把工作区还原到初始基线，再通过 Workspace 流程解析空白会话，
+    // 使新会话的基线恰好是还原后的状态，且能被 UI 正常打开。
     restore = await callApi<RestoreResult>('restore', { sessionId, baseline: true, dryRun: false })
+    const target = workspaceOf(ctx, sessionId)
+    if (target.workspaceId !== undefined && ctx.uiWorkspace.connectWorkspace !== undefined) {
+      childId = await ctx.uiWorkspace.connectWorkspace(target.workspaceId)
+    } else {
+      childId = await ctx.sessions.create(target)
+    }
   } else {
     childId = await ctx.sessions.fork({ sessionId, atSeq: boundarySeqOrNull })
     restore = await callApi<RestoreResult>('restore', { sessionId, atSeq: boundarySeqOrNull, dryRun: false })
   }
+
   await archive(ctx, sessionId)
-  ctx.sessions.open(childId)
+  ctx.uiWorkspace.openSession(childId)
   if (draftText !== undefined && draftText !== '') {
     await setDraftOn(ctx, childId, draftText)
   }
@@ -143,12 +171,12 @@ export async function rollback(
   const childId = await ctx.sessions.fork({ sessionId, atSeq })
   const restore = await callApi<RestoreResult>('restore', { sessionId, atSeq, dryRun: false })
   await archive(ctx, sessionId)
-  ctx.sessions.open(childId)
+  ctx.uiWorkspace.openSession(childId)
   return { childId, restore }
 }
 
 /**
- * 回滚到某个问题提出之前：丢弃该问题及其之后的所有上下文与文件变更
+ * 回滚到某个问题提出之前：丢弃该问题及其之后的所有上下文与文件变更。
  */
 export async function rollbackBefore(
   ctx: ClientContext,
@@ -164,7 +192,7 @@ export function previewRestore(sessionId: string, atSeq: number): Promise<Restor
 }
 
 /**
- * 进入编辑模式：将问题填入输入框并装载提交拦截器，截断操作推迟到提交时执行
+ * 进入编辑模式：将问题填入输入框并装载提交拦截器，截断操作推迟到提交时执行。
  */
 export async function beginEdit(
   ctx: ClientContext,
@@ -178,7 +206,7 @@ export async function beginEdit(
   }
 }
 
-/** 包装会话的 prompt 提问方法，以便在用户下一次提交时重定向到新分叉的子会话 */
+/** 包装会话的 prompt 方法，使用户下一次提交被重定向到新分叉的子会话 */
 function armEditInterceptor(
   ctx: ClientContext,
   sessionId: string,
@@ -191,9 +219,14 @@ function armEditInterceptor(
   if (session.__recoverEditWrapped === true) return
   session.__recoverEditWrapped = true
   const originalPrompt = session.prompt.bind(session)
-  session.prompt = async (content: PromptContent, mode: string): Promise<PromptResult> => {
+  session.prompt = async (
+    content: PromptContent,
+    mode: string,
+    signal?: AbortSignal,
+    requestId?: unknown,
+  ): Promise<PromptResult> => {
     const armed = armedEdits.get(sessionId)
-    if (armed === undefined) return originalPrompt(content, mode)
+    if (armed === undefined) return originalPrompt(content, mode, signal, requestId)
     armedEdits.delete(sessionId)
     try {
       const { childId } = await cutBefore(ctx, sessionId, armed.boundarySeq)
@@ -201,7 +234,8 @@ function armEditInterceptor(
       if (child === undefined) {
         return { ok: false, error: { code: 'internal', message: '编辑失败：子会话不可用' } }
       }
-      return child.session.prompt(content, mode)
+      // requestId 属于旧会话的提交回声，不能转交给子会话。
+      return await child.session.prompt(content, mode)
     } catch (error) {
       return { ok: false, error: { code: 'internal', message: error instanceof Error ? error.message : String(error) } }
     }

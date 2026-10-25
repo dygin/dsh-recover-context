@@ -1,16 +1,16 @@
 /**
- * 用户问题下方的纯图标操作行组件：
+ * 用户问题下方的纯图标操作行组件。
  *
- *   - ↶ 回退图标 — 回退到该问题提出前（丢弃该问题及其之后的所有对话上下文和工作区文件）。
- *     二次确认设计：首次点击切换为红色 ✓ 确认按钮，再次点击执行。
+ *   - ↶ 回退图标 — 回退到该问题提出前（丢弃该问题及其之后的所有对话上下文和
+ *     工作区文件）。二次确认：首次点击切换为红色 ✓，再次点击执行。
  *   - ✎ 编辑图标 — 编辑该问题（仅在最新问题提供）：
- *     将文本载入输入框并装载提交拦截器；只有用户实际点击提交时才触发截断。
+ *     将文本载入输入框并装载提交拦截器；只有用户实际提交时才触发截断。
  */
 import { useEffect, useRef, useState } from 'react'
 import type { ClientContext } from './actions.ts'
 import { beginEdit, rollbackBefore } from './actions.ts'
-import { t } from './locales.ts'
-import { analyzeQuestion, type SnapshotLike } from './snapshot.ts'
+import { fallbackTranslate, type Translate } from './locales.ts'
+import { analyzeQuestion, type ChatSnapshotLike } from './snapshot.ts'
 
 /** 问题操作行属性定义 */
 export interface QuestionActionsProps {
@@ -19,8 +19,11 @@ export interface QuestionActionsProps {
     anchorSeq: number
     data: { seq: number; time: number; content: readonly { type?: string; text?: string }[] }
   }
-  useSession: <T>(selector: (snap: SnapshotLike) => T) => T
+  /** Chat 快照选择器（DSH 0.2.1 标准会话 props） */
+  useChat: <T>(selector: (snap: ChatSnapshotLike) => T) => T
   sessionId: string
+  /** 框架 locale 命名空间绑定的翻译函数 */
+  t?: Translate
 }
 
 /** 撤销/回滚图标 */
@@ -56,7 +59,7 @@ function CheckIcon(): JSX.Element {
 }
 
 const CONFIRM_TIMEOUT_MS = 6000
-let warnedMissingUseSession = false
+let warnedMissingHook = false
 
 /** 包装组件：隔离捕获渲染异常 */
 export function QuestionActions(props: QuestionActionsProps & { ctx: ClientContext }): JSX.Element | null {
@@ -69,15 +72,16 @@ export function QuestionActions(props: QuestionActionsProps & { ctx: ClientConte
 }
 
 function QuestionActionsInner(props: QuestionActionsProps & { ctx: ClientContext }): JSX.Element | null {
-  const { node, sessionId, useSession, ctx } = props
-  if (typeof useSession !== 'function') {
-    if (!warnedMissingUseSession) {
-      warnedMissingUseSession = true
-      console.error('[dsh-recover-context] 未获取到 useSession 方法')
+  const { node, sessionId, useChat, ctx } = props
+  const t = props.t ?? fallbackTranslate
+  if (typeof useChat !== 'function') {
+    if (!warnedMissingHook) {
+      warnedMissingHook = true
+      console.error('[dsh-recover-context] 未获取到 useChat 标准钩子')
     }
     return null
   }
-  const info = useSession(snap => analyzeQuestion(snap, node.key))
+  const info = useChat(snap => analyzeQuestion(snap, node.key))
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
