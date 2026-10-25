@@ -67,6 +67,12 @@ export interface Checkpoint {
    */
   blobs?: Record<string, string>
   /**
+   * 基线是否在会话已经产生事件之后才采集（插件晚于会话启动、或恢复旧会话）。
+   * 这类基线只能说"当时的工作区"，不能代表"本轮工作开始前"，
+   * 因此其中可能已包含此前 Agent 的产物——回退到它无法撤销那些文件。
+   */
+  late?: boolean
+  /**
    * 基线是否在采集过程中与该轮的实际工作重叠（工作区很大时扫描可能慢于
    * 第一次工具调用，导致基线里已包含该轮产物）。为 true 时回退到基线会给出提示。
    */
@@ -103,6 +109,26 @@ export interface CheckpointOptions {
   ioConcurrency?: number
   /** 日志记录器 */
   logger?: { info?: (msg: string) => void; warn?: (msg: string) => void }
+}
+
+/**
+ * 还原无法进行时的结构化原因。
+ * 这些情况**绝不能**被当成"成功但没变化"——否则调用方会继续 fork/归档，
+ * 造成「对话回退了但文件完全没动」的不一致状态。
+ */
+export type RestoreFailure =
+  /** 从未建立基线（插件晚于会话启动、或采集被跳过） */
+  | 'no-baseline'
+  /** 该回滚点没有对应快照，且也无法回落到基线 */
+  | 'no-checkpoint'
+  /** 缺少定位边界所需的事件日志 */
+  | 'no-events'
+
+/** `restore` 的结构化失败（非 dryRun 时抛出） */
+export class RestoreUnavailableError extends Error {
+  constructor(readonly failure: RestoreFailure, message: string) {
+    super(message)
+  }
 }
 
 /** 一次还原操作的结果详情 */
@@ -613,8 +639,11 @@ export class CheckpointStore {
    * 基线必须反映「本轮工作开始前」的状态。若扫描期间工作区已被改动（大仓库扫描较慢，
    * 或插件到得很晚），基线里会混入本轮产物——这样的基线回退时无法撤销那些改动。
    * 这里用 mtime 与扫描起始时间比较来识别该情况，并在回退时明确告警。
+   *
+   * @param now - 快照时间戳。
+   * @param priorEventCount - 采集时该会话已有的事件数；> 0 表示基线是"晚采集"的。
    */
-  async ensureBaseline(now = Date.now()): Promise<Checkpoint> {
+  async ensureBaseline(now = Date.now(), priorEventCount = 0): Promise<Checkpoint> {
     await this.loadBaseline()
     if (this.baseline !== undefined) return this.baseline
     await mkdir(this.dir, { recursive: true })
@@ -629,9 +658,11 @@ export class CheckpointStore {
         break
       }
     }
-    if (raced) {
+    const late = priorEventCount > 0
+    if (raced || late) {
       this.options.logger.warn?.(
-        `[dsh-recover-context] 基线采集期间工作区仍在变化，基线可能已包含本轮改动（${this.root}）`,
+        `[dsh-recover-context] 基线可能不代表"工作开始前"的状态（${this.root}）：`
+        + `${late ? `会话已有 ${priorEventCount} 个事件；` : ''}${raced ? '采集期间工作区仍在变化' : ''}`,
       )
     }
 
@@ -651,6 +682,7 @@ export class CheckpointStore {
       at: now,
       files,
       ...(raced ? { raced: true } : {}),
+      ...(late ? { late: true } : {}),
       ignored: ignoredBaseline.entries,
       ...(ignoredBaseline.truncated ? { ignoredTruncated: true } : {}),
     }
@@ -754,7 +786,8 @@ export class CheckpointStore {
   }
 
   /** 获取指定轮次前最近的可用快照（前一轮或初始基线） */
-  private async previousOf(turn: number): Promise<Checkpoint | undefined> {    if (turn <= 1) {
+  private async previousOf(turn: number): Promise<Checkpoint | undefined> {
+    if (turn <= 1) {
       await this.loadBaseline()
       return this.baseline
     }
@@ -840,9 +873,30 @@ export class CheckpointStore {
   ): Promise<RestoreResult> {
     await this.loadBaseline()
     await this.loadTurns()
+    const dryRun = options.dryRun === true
     const target = this.resolveTarget(events, options.atSeq, options.baseline === true)
     if (target.checkpoint === undefined) {
-      return { mode: 'none', restored: [], deleted: [], skipped: [], dryRun: options.dryRun === true }
+      // 失败必须可见：静默返回 'none' 会让调用方继续 fork/归档，
+      // 最终呈现为「对话回退了但文件没动」。dryRun 允许用来探测可用性。
+      if (dryRun) {
+        return { mode: 'none', restored: [], deleted: [], skipped: [], dryRun: true }
+      }
+      if (this.baseline === undefined) {
+        throw new RestoreUnavailableError(
+          'no-baseline',
+          `会话没有可用基线（${this.dir}）。插件可能在本会话开始后才启用，或基线数据已丢失。`,
+        )
+      }
+      if (events.length === 0) {
+        throw new RestoreUnavailableError(
+          'no-events',
+          '无法读取会话事件日志，不能定位回滚边界。',
+        )
+      }
+      throw new RestoreUnavailableError(
+        'no-checkpoint',
+        `回滚点 ${options.atSeq === undefined ? '(未指定)' : `atSeq=${options.atSeq}`} 没有对应快照。`,
+      )
     }
     const checkpoint = target.checkpoint
     const current = await walkWorkspace(this.root, this.options)
@@ -877,7 +931,6 @@ export class CheckpointStore {
     const restored: string[] = []
     const deleted: string[] = []
     const skipped: { path: string; reason: string }[] = []
-    const dryRun = options.dryRun === true
 
     const absolute = (rel: string): string => resolve(this.root, rel)
     const within = (rel: string): boolean => {
@@ -985,6 +1038,39 @@ export class CheckpointStore {
       warnings.push(
         'baseline-race: 基线是在工作区仍在变化时采集的，可能已包含本轮改动，这些改动无法通过回退撤销',
       )
+    }
+    if (checkpoint.kind === 'baseline' && checkpoint.late === true) {
+      warnings.push(
+        'baseline-late: 基线是在会话已开始之后才采集的（插件启用较晚或恢复了旧会话），'
+        + '此前已存在的产物无法通过回退撤销',
+      )
+    }
+
+    // 还原后自检：确认「目标快照中不存在的文件」确实已从磁盘消失。
+    // 删除可能因权限、并发写入或路径异常而失败；不校验就会出现
+    // 「报告成功、文件却还在」的静默不一致。
+    if (!dryRun && deleted.length > 0) {
+      const after = await walkWorkspace(this.root, this.options)
+      const survivors = deleted.filter(rel => after[rel] !== undefined)
+      if (survivors.length > 0) {
+        for (const rel of survivors) {
+          if (!skipped.some(entry => entry.path === rel)) {
+            skipped.push({ path: rel, reason: 'delete-failed' })
+          }
+        }
+        warnings.push(`残留文件: 有 ${survivors.length} 个文件未能删除，仍存在于工作区`)
+      }
+      // 被忽略路径同样自检
+      const ignoredAfter = await walkIgnoredPaths(this.root, this.options)
+      const ignoredSurvivors = [...ignoredLeftovers].filter(rel => ignoredAfter.entries[rel] !== undefined)
+      if (ignoredSurvivors.length > 0) {
+        warnings.push(`残留文件: 有 ${ignoredSurvivors.length} 个被忽略路径的文件未能删除`)
+        for (const rel of ignoredSurvivors) {
+          if (!skipped.some(entry => entry.path === rel)) {
+            skipped.push({ path: rel, reason: 'delete-failed' })
+          }
+        }
+      }
     }
 
     return {

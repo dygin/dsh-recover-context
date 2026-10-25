@@ -33,6 +33,8 @@ const session = {
 
 /** 捕获的 session/event 监听器 */
 let onEvent = null
+/** 捕获的 session/created 监听器 */
+let onCreated = null
 /** 捕获的 Fetch 路由表 */
 const fetchRoutes = new Map()
 
@@ -43,9 +45,9 @@ const ctx = {
     return typeof out === 'function' ? out : () => {}
   },
   on(event, listener) {
-    if (event !== 'session/event') throw new Error(`unexpected event ${event}`)
-    onEvent = listener
-    return () => { onEvent = null }
+    if (event === 'session/event') { onEvent = listener; return () => { onEvent = null } }
+    if (event === 'session/created') { onCreated = listener; return () => { onCreated = null } }
+    throw new Error(`unexpected event ${event}`)
   },
   sessions: {
     get(id) { return id === sessionId ? session : undefined },
@@ -80,8 +82,12 @@ const ctx = {
 apply(ctx)
 
 if (onEvent === null) throw new Error('apply() 未注册 session/event 监听器')
+if (onCreated === null) throw new Error('apply() 未注册 session/created 监听器（提前采集基线）')
 if (!fetchRoutes.has('/api/recover-context/checkpoints') || !fetchRoutes.has('/api/recover-context/restore')) {
   throw new Error(`Connection Fetch 路由未注册：${JSON.stringify([...fetchRoutes.keys()])}`)
+}
+if (!fetchRoutes.has('/api/recover-context/resetBaseline')) {
+  throw new Error('resetBaseline 路由未注册')
 }
 
 /** 通过插件事件流发送一条会话事件 */
@@ -103,7 +109,9 @@ async function callRoute(method, payload) {
   return { status: response.status, body: await response.json() }
 }
 
-// 基线：会话的首个事件触发工作区快照
+// 基线：会话创建即采集（早于任何一轮工作），确保基线代表"工作开始前"的状态。
+onCreated(session)
+await new Promise(resolve => setTimeout(resolve, 40))
 emit('turn/start', 0, { turn: 1 })
 emit('user/message', 1, { source: { kind: 'user' } })
 

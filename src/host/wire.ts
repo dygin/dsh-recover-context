@@ -13,6 +13,8 @@ export type RecoverErrorCode =
   | 'forbidden'
   | 'method-error'
   | 'internal'
+  /** 目标回滚点无法还原（无基线/无快照/无事件日志）——调用方必须中止流程 */
+  | 'restore-unavailable'
 
 /** 包含 HTTP 状态码与错误码的 API 错误异常类 */
 export class RecoverError extends Error {

@@ -63,15 +63,37 @@ export function isEditArmed(sessionId: string): boolean {
   return armedEdits.has(sessionId)
 }
 
-/** 尽力取消当前运行的轮次（不抛异常） */
-async function cancelIfRunning(ctx: ClientContext, sessionId: string): Promise<void> {
+/**
+ * 取消当前运行的轮次并等待 Agent 真正停下。
+ *
+ * `session.cancel()` 只表示「已接受取消」，不保证 Agent 已停止写入。
+ * 若在它仍在运行时就还原工作区，Agent 可能在还原之后继续落盘，
+ * 造成回退后文件又出现。这里轮询会话快照的 `running` 直到平静（有上限）。
+ *
+ * @returns 是否在超时前确认已停止。
+ */
+async function cancelIfRunning(ctx: ClientContext, sessionId: string): Promise<boolean> {
   const binding = ctx.sessions.binding(sessionId)
-  if (binding === undefined) return
-  try {
-    await binding.session.cancel()
-  } catch {
-    // 尽力取消，即使失败 fork 依然安全
+  if (binding === undefined) return true
+
+  const face = binding.session as PatchableSession & {
+    getSnapshot?: () => { running?: boolean }
   }
+  if (face.getSnapshot?.().running !== true) return true
+
+  try {
+    await face.cancel()
+  } catch {
+    // 尽力取消；仍按下面的轮询判断实际状态
+  }
+
+  // 最多等待约 10 秒（100 × 100ms），留给 Agent 收敛到静止状态。
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const running = face.getSnapshot?.().running
+    if (running !== true) return true
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  return false
 }
 
 /** 归档旧会话（尽力而为） */
@@ -139,14 +161,21 @@ async function cutBefore(
   boundarySeqOrNull: number | null,
   draftText?: string,
 ): Promise<RecoverOperationResult> {
-  await cancelIfRunning(ctx, sessionId)
+  const settled = await cancelIfRunning(ctx, sessionId)
+  if (!settled) {
+    throw new Error('Agent 仍在运行，已中止回退以避免文件在还原后又被写入。请稍后重试。')
+  }
+
+  // 先还原工作区。若还原不可用（无基线/无快照），这里抛出并中止整个流程——
+  // 绝不能先 fork/归档再发现文件没还原，那会让对话与工作区永久不一致。
+  const restoreOptions = boundarySeqOrNull === null
+    ? { sessionId, baseline: true, dryRun: false }
+    : { sessionId, atSeq: boundarySeqOrNull, dryRun: false }
+  const restore = await callApi<RestoreResult>('restore', restoreOptions)
 
   let childId: string
-  let restore: RestoreResult
-
   if (boundarySeqOrNull === null) {
-    // 第一个问题：先还原到初始基线，再创建空白会话，使新会话基线即还原后状态。
-    restore = await callApi<RestoreResult>('restore', { sessionId, baseline: true, dryRun: false })
+    // 首个问题：还原后创建工作区空白会话，使其基线即还原后状态。
     const target = workspaceOf(ctx, sessionId)
     if (target.workspaceId !== undefined && ctx.uiWorkspace.connectWorkspace !== undefined) {
       childId = await ctx.uiWorkspace.connectWorkspace(target.workspaceId)
@@ -157,8 +186,7 @@ async function cutBefore(
     // （可能包含刚刚被还原删除的文件）。对齐到还原后的真实工作区。
     await resetBaselineQuietly(childId)
   } else {
-    // 先还原到该边界，再分叉：子会话基线因此反映还原后的真实状态。
-    restore = await callApi<RestoreResult>('restore', { sessionId, atSeq: boundarySeqOrNull, dryRun: false })
+    // 还原已让工作区对齐边界状态，分叉出的子会话基线因此正确。
     childId = await ctx.sessions.fork({ sessionId, atSeq: boundarySeqOrNull })
   }
 
@@ -179,7 +207,10 @@ export async function rollback(
   sessionId: string,
   atSeq: number,
 ): Promise<RecoverOperationResult> {
-  await cancelIfRunning(ctx, sessionId)
+  const settled = await cancelIfRunning(ctx, sessionId)
+  if (!settled) {
+    throw new Error('Agent 仍在运行，已中止回退以避免文件在还原后又被写入。请稍后重试。')
+  }
   const restore = await callApi<RestoreResult>('restore', { sessionId, atSeq, dryRun: false })
   const childId = await ctx.sessions.fork({ sessionId, atSeq })
   await archive(ctx, sessionId)

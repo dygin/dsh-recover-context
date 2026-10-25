@@ -19,7 +19,7 @@
 import { mkdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
-import { CheckpointStore, type CheckpointOptions } from './checkpoints.ts'
+import { CheckpointStore, RestoreUnavailableError, type CheckpointOptions } from './checkpoints.ts'
 import {
   RecoverError, errorResponse, isTrustedNodeRequest, okResponse, optionalBoolean,
   optionalNumber, readJsonRequest, readNodeJsonBody, requireString,
@@ -40,8 +40,13 @@ export type { Checkpoint, CheckpointOptions, RestoreResult, TrackedFile, Gitigno
 interface SessionLike {
   id: string
   header: { cwd?: string; origin?: 'subagent'; id: string }
+  /**
+   * fork 子会话从父会话继承的事件前缀长度。
+   * 这些 seeded 事件属于父会话的历史，不代表本会话已经"开始工作"。
+   */
+  inheritedEventCount?: number
   /** 旧版实时快照读取（持久化服务缺失时的回退） */
-  snapshotEvents?(): readonly EventLike[]
+  snapshotEvents?(fromSeq?: number): readonly EventLike[]
 }
 
 /** 单个事件行的结构镜像 */
@@ -187,16 +192,63 @@ export function apply(ctx: RecoverContext): void {
     return store
   }
 
-  /** 监听会话事件流 → 自动创建基线与轮次检查点 */
+  /**
+   * 本会话自己发起的轮次数（不含 fork 继承的 seeded 事件）。
+   *
+   * 不能简单用"事件条数 > 0"判断：新建会话本身就带有若干初始事件（session marker、
+   * 初始上下文等），fork 子会话还继承父会话的历史。只有本会话自己的 `turn/start`
+   * 才说明用户已提问、Agent 可能开始改动工作区。
+   */
+  function startedTurns(session: SessionLike): number {
+    try {
+      // 跳过 fork 继承的前缀：那是父会话的历史，不是本会话的工作
+      const from = session.inheritedEventCount ?? 0
+      const list = session.snapshotEvents?.(from) ?? []
+      return list.filter(event => event.type === 'turn/start').length
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * 尽早采集基线：会话一被创建（`session/created`）就开始快照，
+   * 此时用户还没提问、Agent 也还没动任何文件。
+   *
+   * 这一点对「编辑/回退能否撤销本轮产物」至关重要：基线必须代表"工作开始前"的状态。
+   * 若拖到第一条 `session/event` 才采集，大工作区的扫描可能与该轮的实际工作重叠，
+   * 让 Agent 刚写出的文件被当成"原本就存在"，之后编辑/回退自然撤不掉它们。
+   */
   ctx.effect(() => {
-    const off = ctx.on('session/event', (session, event) => {
+    const off = ctx.on('session/created', (session) => {
       const sessionId = session.header.id ?? session.id
-      if (session.header.origin === 'subagent') return // 子代理共享父会话的 cwd，不重复采集
+      if (session.header.origin === 'subagent') return
+      const prior = startedTurns(session)
       void enqueue(sessionId, async () => {
         const store = await storeFor(sessionId)
         if (store === undefined) return
         try {
-          await store.ensureBaseline()
+          await store.ensureBaseline(Date.now(), prior)
+        } catch (error) {
+          ctx.logger.warn(`dsh-recover-context: 会话 ${sessionId} 基线采集失败: ${String(error)}`)
+        }
+      })
+    })
+    return off
+  }, 'dsh-recover-context: early baseline')
+
+  /** 监听会话事件流 → 兜底创建基线 + 逐轮检查点 */
+  ctx.effect(() => {
+    const off = ctx.on('session/event', (session, event) => {
+      const sessionId = session.header.id ?? session.id
+      if (session.header.origin === 'subagent') return // 子代理共享父会话的 cwd，不重复采集
+      // 兜底路径：若 session/created 没赶上（或宿主未提供），这里采集。
+      // 此时会话已有事件，故标记为晚采集，让回退时能如实告警。
+      const prior = startedTurns(session)
+      void enqueue(sessionId, async () => {
+        const store = await storeFor(sessionId)
+        if (store === undefined) return
+        try {
+          await store.ensureBaseline(Date.now(), prior)
           if (event.type === 'turn/end' && event.data?.turn !== undefined) {
             await store.recordTurn(event.data.turn, event.seq)
           }
@@ -285,7 +337,17 @@ export function apply(ctx: RecoverContext): void {
         throw new RecoverError('not-found', `未找到会话 "${sessionId}" 的恢复上下文记录`, 404)
       }
       const events = await eventsOf(sessionId)
-      const result = await enqueue(sessionId, async () => store.restore(events, { atSeq, baseline, dryRun }))
+      let result
+      try {
+        result = await enqueue(sessionId, async () => store.restore(events, { atSeq, baseline, dryRun }))
+      } catch (error) {
+        // 还原不可用时必须让调用方失败，而不是让它继续 fork/归档：
+        // 否则会出现「对话已回退、文件却没动」的不一致状态。
+        if (error instanceof RestoreUnavailableError) {
+          throw new RecoverError('restore-unavailable', `${error.failure}: ${error.message}`, 409)
+        }
+        throw error
+      }
       if (result === undefined) throw new RecoverError('internal', '恢复任务执行失败')
       return result
     },

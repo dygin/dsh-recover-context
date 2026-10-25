@@ -332,6 +332,48 @@ try {
     assertTrue(refused === false, '已有轮次检查点的会话应拒绝重建基线')
   }
 
+  // ── 还原不可用时必须报错，而不是静默返回空结果 ──────────────────────────
+  {
+    const emptyWs = join(base, 'ws-empty')
+    const emptyData = join(base, 'data-empty')
+    await mkdir(emptyWs, { recursive: true })
+    const emptyStore = new CheckpointStore(emptyData, emptyWs)
+    let threw = false
+    try {
+      await emptyStore.restore([], { baseline: true })
+    } catch (error) {
+      threw = true
+      assertEqual(error.failure, 'no-baseline', '无基线时应报 no-baseline')
+    }
+    assertTrue(threw, '无基线时 restore 必须抛错，不得静默成功')
+
+    // dryRun 仍可用于探测（不抛错，返回 mode: none）
+    const probe = await emptyStore.restore([], { baseline: true, dryRun: true })
+    assertEqual(probe.mode, 'none', 'dryRun 探测允许返回 none')
+  }
+
+  // ── 晚采集的基线必须如实告警（它无法撤销此前已存在的产物）────────────────
+  {
+    const lateWs = join(base, 'ws-late')
+    const lateData = join(base, 'data-late')
+    await mkdir(lateWs, { recursive: true })
+    await writeFile(join(lateWs, 'keep.txt'), 'base\n')
+    // 会话已经产生过事件（priorEventCount > 0），且 Agent 已写出 1.txt
+    await writeFile(join(lateWs, '1.txt'), 'agent output\n')
+    const lateStore = new CheckpointStore(lateData, lateWs)
+    const lateBaseline = await lateStore.ensureBaseline(Date.now(), 5)
+    assertTrue(lateBaseline.late === true, '会话已启动后采集的基线应标记 late')
+    assertTrue('1.txt' in lateBaseline.files, '晚采集基线会含已有产物（这正是问题所在）')
+
+    const lateRestore = await lateStore.restore([], { baseline: true, dryRun: false })
+    assertTrue(
+      (lateRestore.warnings ?? []).some(w => w.startsWith('baseline-late')),
+      '回退到晚采集基线时必须给出 baseline-late 告警',
+    )
+    // 1.txt 属于基线内容，因此不会被删除——告警正是为了说明这一点
+    assertTrue(await exists(join(lateWs, '1.txt')) === true, '晚采集基线中原有产物不会被删除')
+  }
+
   console.log('checkpoints.test.mjs: all assertions passed ✓')
 } finally {
   await rm(base, { recursive: true, force: true })

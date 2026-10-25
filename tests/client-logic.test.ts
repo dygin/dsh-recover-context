@@ -99,6 +99,8 @@ function fakeCtx(overrides: Partial<ClientContext> = {}): ClientContext & { call
       let session = sessionCache.get(id)
       if (session === undefined) {
         session = {
+          // 假会话默认已空闲：cancelIfRunning 读取 running 后直接返回。
+          getSnapshot: () => ({ running: false }),
           cancel: async () => { calls.push('cancel') },
           prompt: async (content: unknown, mode: unknown) => {
             calls.push(`prompt:${JSON.stringify(content)}:${mode}`)
@@ -187,10 +189,57 @@ function withRestoreStub<T>(
   assert.equal(result.childId, 'child-1')
   assert.deepEqual(
     ctx.calls,
-    ['cancel', 'restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1'],
+    ['restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1'],
     '回退必须先还原工作区，再分叉子会话',
   )
   assert.equal(result.restore.mode, 'turn')
+}
+
+// 运行中的会话：必须先 cancel 并确认停止，再还原
+{
+  let running = true
+  const ctx = fakeCtx()
+  const originalBinding = ctx.sessions.binding
+  ;(ctx.sessions as { binding: (id: string) => unknown }).binding = (id: string) => {
+    const binding = originalBinding(id) as { session: Record<string, unknown> } | undefined
+    if (binding === undefined) return undefined
+    binding.session.getSnapshot = () => ({ running })
+    binding.session.cancel = async () => {
+      ctx.calls.push('cancel')
+      // 模拟 Agent 在取消后稍晚收敛
+      setTimeout(() => { running = false }, 120)
+    }
+    return binding
+  }
+  await withRestoreStub(ctx.calls, 'turn', () => rollback(ctx, 's1', 10))
+  assert.deepEqual(
+    ctx.calls,
+    ['cancel', 'restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1'],
+    '运行中回退必须先取消并等待停止，再还原',
+  )
+}
+
+// 运行中且始终不停止：必须中止，绝不 fork/归档造成不一致
+{
+  const ctx = fakeCtx()
+  const originalBinding = ctx.sessions.binding
+  ;(ctx.sessions as { binding: (id: string) => unknown }).binding = (id: string) => {
+    const binding = originalBinding(id) as { session: Record<string, unknown> } | undefined
+    if (binding === undefined) return undefined
+    binding.session.getSnapshot = () => ({ running: true })
+    binding.session.cancel = async () => { ctx.calls.push('cancel') }
+    return binding
+  }
+  await withRestoreStub(ctx.calls, 'turn', async () => {
+    let failed = false
+    try {
+      await rollback(ctx, 's1', 10)
+    } catch {
+      failed = true
+    }
+    assert(failed, 'Agent 未停止时必须报错中止')
+  })
+  assert.deepEqual(ctx.calls, ['cancel'], '中止后不得执行还原、fork 或归档')
 }
 
 // rollbackBefore 首个问题：先还原基线，再创建空白会话
@@ -199,7 +248,7 @@ function withRestoreStub<T>(
   await withRestoreStub(ctx.calls, 'baseline', () => rollbackBefore(ctx, 's1', null))
   assert.deepEqual(
     ctx.calls,
-    ['cancel', 'restore:baseline', 'connect:w1', 'resetBaseline:child-blank', 'archive:s1', 'open:child-blank'],
+    ['restore:baseline', 'connect:w1', 'resetBaseline:child-blank', 'archive:s1', 'open:child-blank'],
     '首问回滚应先还原基线，再创建空白子会话、归档旧会话并打开新会话',
   )
 }
@@ -227,7 +276,7 @@ function withRestoreStub<T>(
   })
   assert.deepEqual(
     ctx.calls,
-    ['draft:edited question', 'cancel', 'restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1', 'prompt:[{"type":"text","text":"edited question"}]:queue'],
+    ['draft:edited question', 'restore:atSeq=10', 'fork:10', 'archive:s1', 'open:child-1', 'prompt:[{"type":"text","text":"edited question"}]:queue'],
     '提交时必须先还原工作区再分叉，否则子会话基线会记录本轮残留文件',
   )
 }
@@ -244,7 +293,7 @@ function withRestoreStub<T>(
   })
   assert.deepEqual(
     ctx.calls,
-    ['draft:edited first question', 'cancel', 'restore:baseline', 'connect:w1', 'resetBaseline:child-blank', 'archive:s1', 'open:child-blank', 'prompt:[{"type":"text","text":"edited first question"}]:queue'],
+    ['draft:edited first question', 'restore:baseline', 'connect:w1', 'resetBaseline:child-blank', 'archive:s1', 'open:child-blank', 'prompt:[{"type":"text","text":"edited first question"}]:queue'],
     '首问编辑应先还原基线，再创建空白子会话并提问',
   )
 }
